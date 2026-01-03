@@ -1,0 +1,7 @@
+confluent-kafka
+pandas
+python-dotenv
+elasticsearch
+fastapi
+uvicorn
+apache-beam[gcp]
