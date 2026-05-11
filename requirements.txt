@@ -5,3 +5,4 @@ elasticsearch
 fastapi
 uvicorn
 apache-beam[gcp]
+pytest
