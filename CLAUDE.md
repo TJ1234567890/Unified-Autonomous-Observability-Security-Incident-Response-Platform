@@ -11,6 +11,12 @@
 
 ---
 
+## STANDING RULE: GIT COMMITS
+
+When creating any git commit in this project, **do NOT include a `Co-Authored-By: Claude` line** in the commit message. Write clean commit messages with no authorship footers.
+
+---
+
 ## SECTION 1: WHO YOU ARE WORKING WITH
 
 **Name:** Tejes (Tejessrihari Paidi)
@@ -295,11 +301,103 @@ The `.gitignore` includes `*.tfstate` and `*.tfstate.backup` — these are Terra
 
 ---
 
-## SECTION 6: THE BETH DATASET
+## SECTION 6: PROJECT DIRECTORY STRUCTURE
+
+**Critical note for Windows setup:** Git does not track empty directories. Several folders that exist in the project were created for future phases but contain no files yet. They will NOT appear after a `git clone` or `git pull` on Windows. You must recreate them manually. The structure below shows every directory that should exist, which ones have files, and which ones are empty placeholders.
+
+```
+Unified-Autonomous-Observability-Security-Incident-Response-Platform/
+│
+├── CLAUDE.md                          ← this file
+├── README.md
+├── LICENSE
+├── docker-compose.yml                 ← starts local Elasticsearch
+├── requirements.txt                   ← all Python dependencies
+├── run.sh                             ← convenience script
+├── .gitignore
+│
+├── data/                              ← GITIGNORED ENTIRELY (data/* in .gitignore)
+│   └── archive/                       ← *** BETH DATASET LIVES HERE ***
+│       └── *.csv files                ← must be downloaded manually (see Section 7)
+│
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── adr/
+│       └── 0001-optimal-defaults.md
+│
+├── infra/
+│   └── terraform/                     ← EMPTY — placeholder for future Terraform configs
+│                                         (provisioning Confluent Cloud, Elastic Cloud, etc.)
+│
+├── pipelines/
+│   └── beam-indexer/                  ← EMPTY — placeholder for future standalone Beam pipeline
+│                                         (currently the pipeline lives in tools/dataset-ingestor/)
+│
+├── schemas/
+│   └── v1/                            ← EMPTY — placeholder for future Avro/Protobuf schemas
+│                                         (will hold schema files once data contracts are finalized)
+│
+├── services/
+│   ├── context-retrieval/             ← EMPTY — Phase 3 service (vector search)
+│   ├── genai-gateway/                 ← EMPTY — Phase 4 service (LLM traffic gateway)
+│   └── incident-orchestrator/         ← EMPTY — Phase 5 service (incident copilot)
+│
+└── tools/
+    └── dataset-ingestor/              ← Phase 1 COMPLETE — all active code lives here
+        ├── config.py                  ← Kafka + ES config, loads .env
+        ├── producer.py                ← reads CSVs, publishes raw rows to Kafka
+        ├── parsers.py                 ← DnsParser, DeepKernelParser, StandardHostParser
+        ├── ingestor.py                ← Kafka consumer + Beam pipeline → Elasticsearch
+        └── test_parsers.py            ← 24 pytest unit tests, all passing
+```
+
+### Directories to create manually on Windows after cloning
+
+These are empty and will not exist after `git clone`. Create them before running anything:
+
+```bash
+# On Windows (PowerShell or Command Prompt)
+mkdir data\archive
+mkdir infra\terraform
+mkdir pipelines\beam-indexer
+mkdir schemas\v1
+mkdir services\context-retrieval
+mkdir services\genai-gateway
+mkdir services\incident-orchestrator
+```
+
+```bash
+# On macOS/Linux
+mkdir -p data/archive infra/terraform pipelines/beam-indexer schemas/v1 \
+         services/context-retrieval services/genai-gateway services/incident-orchestrator
+```
+
+The only one that matters immediately is `data/archive/` — that is where the BETH dataset CSV files must be placed before running the producer.
+
+---
+
+## SECTION 7: THE BETH DATASET
 
 **What it is:** BETH (Behaviour-based Evasion Technique Hunting) — real logs collected from AWS EC2 honeypot instances by security researchers. Contains real attack traffic and real benign traffic with ground-truth labels.
 
-**Where to download:** Kaggle. Search "BETH dataset" on kaggle.com. The user already has it on the Mac at `data/archive/`. This directory is gitignored (`data/*` in `.gitignore`) and must be re-downloaded on any new machine.
+**Where to download:** Kaggle — direct link: https://www.kaggle.com/datasets/katehighnam/beth-dataset
+
+The user already has it on the Mac at `data/archive/`. This directory is gitignored (`data/*` in `.gitignore`) and must be re-downloaded on any new machine.
+
+**How to download on Windows:**
+1. Go to https://www.kaggle.com/datasets/katehighnam/beth-dataset in a browser
+2. Sign in or create a Kaggle account (free)
+3. Click the Download button — downloads a `.zip` file
+4. Extract it into `data/archive/` in the project directory
+5. After extracting, confirm you see `.csv` files directly inside `data/archive/`
+
+**Alternatively, use the Kaggle CLI:**
+```bash
+pip install kaggle
+# Place your kaggle.json API token at ~/.kaggle/kaggle.json (macOS/Linux)
+# or C:\Users\<you>\.kaggle\kaggle.json (Windows)
+kaggle datasets download -d katehighnam/beth-dataset --unzip -p data/archive/
+```
 
 **Three CSV file types, each with different column naming conventions:**
 
