@@ -16,7 +16,7 @@ class DnsParser(Parser):
                 "source_ip": row.get("SourceIP", ""),
                 "destination_ip": row.get("DestinationIP", ""),
                 "dns_query": row.get("DnsQuery", ""),
-                "dns_response_code": row.get("DnsResponseCode", "") 
+                "dns_response_code": row.get("DnsResponseCode", None)
             },
             "labels": {                                            
                 "sus": row.get("sus", 0),
