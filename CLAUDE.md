@@ -443,7 +443,7 @@ Reads CSV files row by row. Publishes raw, unparsed rows to Kafka. Never runs th
 
 **`glob.glob()` explained:** `glob.glob("data/archive/*.csv")` returns a Python list of all file paths that match the pattern. The `*` is a wildcard — it matches any characters. So this returns every `.csv` file inside `data/archive/`. This is how the producer discovers which files to process when you pass a directory instead of a single specific file. It's essentially: "find me all CSV files in this folder."
 
-**`chunksize=1000` in `pd.read_csv()`:** The producer reads each CSV file with `pd.read_csv(file, chunksize=1000)`. This does NOT load the entire file into memory at once. Instead, it returns an iterator — each iteration gives you a DataFrame of 1000 rows (the last chunk may be smaller). This is a memory efficiency decision: a large CSV with 500,000 rows would use hundreds of MB of RAM if read all at once. With `chunksize=1000`, only 1000 rows are ever in memory at a time, so RAM usage stays flat regardless of file size. The outer loop iterates over chunks, the inner loop iterates over rows within each chunk.
+**`chunksize=10_000` in `pd.read_csv()`:** The producer reads each CSV file with `pd.read_csv(file, chunksize=10_000)`. This does NOT load the entire file into memory at once. Instead, it returns an iterator — each iteration gives you a DataFrame of 10,000 rows (the last chunk may be smaller). This is a memory efficiency decision: a large CSV with 500,000 rows would use hundreds of MB of RAM if read all at once. With `chunksize=10_000`, only 10,000 rows are ever in memory at a time, so RAM usage stays flat regardless of file size. The outer loop iterates over chunks; the inner loop uses `chunk.iterrows()` which yields `(index, row)` tuples, then calls `row.to_dict()` on each row to get a plain Python dict.
 
 **Key design decision:** Publish raw data, parse downstream. Reasons:
 1. If parser logic changes later, you can replay the Kafka topic without re-reading the CSV files.
@@ -459,9 +459,9 @@ Message format (one message per CSV row):
 }
 ```
 
-`log_type` derived from filename patterns (`_dns.csv` → `"dns"`, `_host.csv` → `"standard_host"`, else → `"deep_kernel"`). Derivation is acceptable in the producer because it doesn't destroy raw data — it just tags the envelope.
+`log_type` derived from filename patterns: `"-dns" in filename` → `"dns"`; `"training"/"testing"/"validation" in filename` → `"deep_kernel"`; else → `"standard_host"`. Derivation is acceptable in the producer because it doesn't destroy raw data — it just tags the envelope.
 
-**`chunk.to_dict('records')` explained:** `df.to_dict('records')` converts a pandas DataFrame into a Python list of dicts, where each dict represents one row. The DataFrame's index (row numbers) is discarded — only column values are kept. Example: a 3-row DataFrame becomes `[{"col1": val, "col2": val}, {"col1": val, "col2": val}, {"col1": val, "col2": val}]`. This is the standard way to turn pandas rows into plain Python dicts for JSON serialization or sending over a network. The user was explicitly unsure about this during the quiz.
+**`chunk.iterrows()` and `row.to_dict()` — how the producer turns rows into dicts:** The actual code iterates with `chunk.iterrows()`, which yields `(index, row)` tuples. The `_` discards the index; `row.to_dict()` converts the pandas Series for that single row into a plain Python dict. Note: `df.to_dict('records')` is a related pandas method that converts an entire DataFrame into a list of row dicts in one call — the user was taught this as a concept during the quiz but the actual producer.py uses `iterrows()` + `row.to_dict()` instead. Both produce equivalent row dicts.
 
 **`delivery_report(err, msg)` callback function:** This function is passed as `callback=delivery_report` to every `producer.produce()` call. librdkafka calls it asynchronously (via `poll()`) when the Kafka broker either acknowledges or rejects a message. Parameters: `err` is `None` on success, an error object on failure. `msg` is the message that was produced (contains topic, partition, offset on success). The current implementation only logs failures — it does nothing on success. To count successful deliveries, you'd add an `else` branch that increments a counter. The user correctly identified this during the producer quiz (Q7). Important: this callback runs inside the `poll(0)` call, not inside `produce()`. If you never call `poll()`, callbacks never fire.
 
@@ -988,7 +988,7 @@ eBPF programs are compiled to BPF bytecode and loaded into the Linux kernel. Req
 | Beam WARNING: no iterator in WriteToEs | Warning only, terminal sink doesn't yield | Acceptable |
 | No Avro/Protobuf schema on Kafka topic | No data contract enforcement | Add after Phase 1 data model is finalized |
 | ES mapping not explicitly enforced | Dynamic mapping can drift over time | Add explicit index template with all field types locked |
-| No ES persistence in Docker | Data lost if container is deleted | Add Docker volume mount in docker-compose.yml |
+| ES data lost if Docker volume deleted | `docker volume rm es_data` destroys all data; normal container restarts are safe | Volume `es_data` already in docker-compose.yml — do not delete the volume |
 | Confluent CLI not documented in repo | New machines need manual CLI setup | Add to SETUP.md or README |
 | ES running in local Docker | Not production-grade | Migrate to Elastic Cloud (paid) when project scales |
 | Pipeline is batch not true streaming | All messages collected before processing begins | Switch to a proper streaming source (Beam KafkaIO) in later phases |
