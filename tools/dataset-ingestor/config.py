@@ -16,21 +16,6 @@ from dotenv import load_dotenv
 # Anyone who clones the repo gets an empty shell — they provide their own .env.
 load_dotenv()
 
-"""
-KAFKA_API_KEY = CK4Z6ZR4QT2KF2RT
-KAFKA_SECRET = cfltu2sMmztFr5Ap4KegecG2363v4efNAnzZsAppJP4JiCboQtl0ipu5K4eXWI1g
-KAFKA_BOOTSTRAP_SERVER = pkc-619z3.us-east1.gcp.confluent.cloud:9092
-KAFKA_RESOURCES = lkc-2zq5w2
-
-ELASTIC_API_KEY = eUgwTmdac0JuWWxFRGtndVpSelE6OUVFR0N3MEdtMXdWdHZMb1RHZFpBUQ==
-ELASTIC_URL = http://localhost:9200
-
-# CONSUMER_MODE controls how the Kafka consumer reads messages.
-# "dev"        — assign() at OFFSET_BEGINNING, always reads all data fresh (local testing)
-# "production" — subscribe() via consumer group, resumes from last committed offset (multi-worker)
-CONSUMER_MODE = production
-"""
-
 # --- Kafka Configuration (Confluent Cloud) ---
 
 KAFKA_BOOTSTRAP_SERVER = os.getenv("KAFKA_BOOTSTRAP_SERVER")
