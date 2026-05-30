@@ -1,11 +1,11 @@
 """
-Beam Consumer Pipeline — reads messages from Kafka, parses them, writes to Elasticsearch.
+Beam Consumer Pipeline -- reads messages from Kafka, parses them, writes to Elasticsearch.
 
 ARCHITECTURE:
     Kafka (security.logs.raw)
-        → confluent-kafka consumer pulls messages into a Python list
-        → Beam pipeline processes them:
-            1. Parse JSON string → Python dict
+        -> confluent-kafka consumer pulls messages into a Python list
+        -> Beam pipeline processes them:
+            1. Parse JSON string -> Python dict
             2. Route to correct parser (DnsParser, DeepKernelParser, StandardHostParser)
             3. Write cleaned documents to Elasticsearch
 
@@ -15,13 +15,16 @@ WHY TWO LAYERS:
     but overkill for local dev with DirectRunner. So we separate:
         - Layer 1: Kafka consumption (confluent-kafka, same library as the producer)
         - Layer 2: Beam pipeline (parsing + ES writes)
-    When deploying to Flink later, Layer 1 gets replaced by ReadFromKafka — one swap.
+    When deploying to Flink later, Layer 1 gets replaced by ReadFromKafka -- one swap.
 """
 
+import hashlib
 import json
 import math
+import re
 import logging
 import os
+from collections import Counter
 
 import apache_beam as beam
 from apache_beam.options.pipeline_options import PipelineOptions
@@ -41,34 +44,124 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Layer 1: Kafka Consumer — pulls a batch of messages from the topic
+# Feature Extraction -- compiled at module load, reused for every document
 # ---------------------------------------------------------------------------
 
-CONSUMER_MODE = os.getenv("CONSUMER_MODE", "dev")
+_SHELL_RE = re.compile(r'/bin/bash|/bin/sh|/bin/zsh|cmd\.exe|powershell', re.IGNORECASE)
+_NETWORK_RE = re.compile(r'\bcurl\b|\bwget\b|\bnc\b|\bnetcat\b|\bncat\b|\bsocat\b', re.IGNORECASE)
+_SENSITIVE_PATH_RE = re.compile(r'/etc/passwd|/etc/shadow|/etc/sudoers|/root/|/proc/\d+', re.IGNORECASE)
+
+_PROCESS_EXEC_EVENTS = {'execve', 'execveat', 'fork', 'vfork', 'clone'}
+_FILE_ACCESS_EVENTS = {'openat', 'open', 'read', 'write', 'unlink', 'rename', 'mkdir', 'rmdir', 'stat', 'lstat', 'fstat'}
+_NETWORK_EVENTS = {'connect', 'accept', 'bind', 'listen', 'socket', 'sendto', 'recvfrom', 'sendmsg', 'recvmsg'}
+_MEMORY_EVENTS = {'mmap', 'mprotect', 'munmap', 'brk', 'mlock'}
 
 
-def consume_from_kafka(max_messages=1000, timeout_sec=10):
+def _shannon_entropy(s: str) -> float:
     """
-    Pull up to max_messages from Kafka, then stop.
+    Compute Shannon entropy of a string. High entropy means high randomness.
+    A domain like 'google.com' has low entropy (~2.5 bits). A DGA domain like
+    'x7f3a9b2c.ru' has high entropy (~3.5+ bits) because characters are more
+    uniformly distributed. Threshold ~3.5 is a reasonable malware signal.
+    """
+    if not s:
+        return 0.0
+    counts = Counter(s)
+    n = len(s)
+    return -sum((c / n) * math.log2(c / n) for c in counts.values())
+
+
+def extract_features(element: dict) -> dict:
+    """
+    Compute ML-ready feature signals from a parsed document.
+
+    WHY beam.Map AND NOT beam.ParDo:
+    Every document in -> exactly one enriched document out. No zero-output case,
+    no stateful setup needed (regex patterns are module-level constants, not
+    per-worker connections). beam.Map is the right abstraction for pure 1-to-1
+    transforms. beam.ParDo is for 0/1/many outputs or DoFn lifecycle (setup,
+    finish_bundle, teardown).
+
+    WHY features ARE NESTED UNDER 'features':
+    Keeps the ES document schema clean. Parsed fields stay in their existing
+    locations. Feature fields are grouped so any query or ML pipeline can select
+    them with a single ES source filter: '_source.includes': ['features.*'].
+
+    WHY DEFAULT IS 0 NOT None FOR BINARY FLAGS:
+    For ML features we compute ourselves, 0 means 'not observed'. That IS the
+    correct signal. None would mean 'unknown', which gets dropped or imputed
+    during training -- wasting data. 0 is directly consumable by XGBoost.
+    """
+    features = {}
+    attrs = element.get("attributes", {})
+
+    if element.get("log_attribute") == "network_dns":
+        query = str(attrs.get("dns_query") or "")
+        response_code = attrs.get("dns_response_code")
+
+        features["feat_dns_query_length"] = len(query)
+        features["feat_dns_query_entropy"] = round(_shannon_entropy(query), 4)
+        features["feat_dns_num_subdomains"] = query.count(".") if query else 0
+        features["feat_dns_failed"] = 0 if response_code == 0 else 1
+
+    else:
+        args = str(attrs.get("args") or "")
+        event_name = str(element.get("event_name") or "")
+
+        try:
+            rv = int(attrs.get("return_value") or 0)
+        except (ValueError, TypeError):
+            rv = 0
+
+        try:
+            uid = int(attrs.get("user_id") or -1)
+        except (ValueError, TypeError):
+            uid = -1
+
+        features["feat_is_root_user"] = 1 if uid == 0 else 0
+        features["feat_return_failed"] = 1 if rv < 0 else 0
+        features["feat_args_length"] = len(args)
+        features["feat_args_has_shell"] = 1 if _SHELL_RE.search(args) else 0
+        features["feat_args_has_network"] = 1 if _NETWORK_RE.search(args) else 0
+        features["feat_args_has_sensitive_path"] = 1 if _SENSITIVE_PATH_RE.search(args) else 0
+
+        if event_name in _PROCESS_EXEC_EVENTS:
+            features["feat_event_category"] = "process_exec"
+        elif event_name in _FILE_ACCESS_EVENTS:
+            features["feat_event_category"] = "file_access"
+        elif event_name in _NETWORK_EVENTS:
+            features["feat_event_category"] = "network"
+        elif event_name in _MEMORY_EVENTS:
+            features["feat_event_category"] = "memory"
+        else:
+            features["feat_event_category"] = "other"
+
+    return {**element, "features": features}
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: Kafka Consumer -- builds consumer once, polls in batches
+# ---------------------------------------------------------------------------
+
+CONSUMER_MODE: str = os.getenv("CONSUMER_MODE", "dev")
+
+
+def _build_consumer():
+    """
+    Create and configure the Kafka consumer. Called once in main() so the
+    partition assignment and group rebalance happen only once, not once per batch.
 
     TWO MODES controlled by CONSUMER_MODE in .env:
 
     DEV mode (default):
-        Uses assign() with OFFSET_BEGINNING. Reads all messages from the start
-        every run. Deterministic and instant — no rebalance, no group coordination.
-        Use this locally when you always want to reprocess the full dataset.
+        Uses assign() with OFFSET_BEGINNING. Always reads from offset 0 --
+        bypasses committed offsets entirely. Right for local testing where
+        you want a clean full replay every time.
 
     PRODUCTION mode:
-        Uses subscribe() so Kafka distributes partitions across multiple workers.
-        Resumes from the last committed offset — workers never re-read messages
-        already processed. Run the same script on 5 machines and they each get
-        a share of the partitions without stepping on each other.
-
-    WHY THE DISTINCTION:
-        In production you NEVER want to reset to beginning — that would reprocess
-        every event ever received. Workers resume from where they stopped. That's
-        the entire value of consumer groups. Reading from beginning is only for
-        dev/testing where you want a clean fresh run every time.
+        Uses subscribe() -- Kafka distributes partitions across workers via the
+        group coordinator and resumes from the last committed offset. Multiple
+        workers share the topic without stepping on each other.
     """
     consumer_config = {
         "bootstrap.servers": KAFKA_PRODUCER_CONFIG["bootstrap.servers"],
@@ -76,17 +169,13 @@ def consume_from_kafka(max_messages=1000, timeout_sec=10):
         "sasl.mechanisms": KAFKA_PRODUCER_CONFIG["sasl.mechanisms"],
         "sasl.username": KAFKA_PRODUCER_CONFIG["sasl.username"],
         "sasl.password": KAFKA_PRODUCER_CONFIG["sasl.password"],
-        "group.id": "beam-ingestor",
+        "group.id": "beam-ingestor-v2",
         "auto.offset.reset": "earliest",
     }
 
     consumer = Consumer(consumer_config)
 
     if CONSUMER_MODE == "production":
-        # subscribe() — Kafka assigns partitions via the group coordinator.
-        # Multiple workers each get a subset of partitions. Kafka tracks offsets
-        # per group so each message is processed by exactly one worker.
-        # We wait for the rebalance to complete before polling for messages.
         logger.info("PRODUCTION mode: subscribing to topic (group-managed partitions)...")
         consumer.subscribe([KAFKA_TOPIC])
         logger.info("Waiting for partition assignment via rebalance...")
@@ -94,9 +183,6 @@ def consume_from_kafka(max_messages=1000, timeout_sec=10):
             consumer.poll(1.0)
         logger.info(f"Partitions assigned: {[p.partition for p in consumer.assignment()]}")
     else:
-        # assign() — we directly take all partitions at offset 0.
-        # Instant, deterministic, always reads from the beginning.
-        # No group coordinator, no rebalance. Right for local dev.
         logger.info("DEV mode: assigning all partitions from beginning...")
         metadata = consumer.list_topics(KAFKA_TOPIC, timeout=10)
         partition_ids = list(metadata.topics[KAFKA_TOPIC].partitions.keys())
@@ -104,49 +190,92 @@ def consume_from_kafka(max_messages=1000, timeout_sec=10):
         consumer.assign(partitions)
         logger.info(f"Assigned partitions {partition_ids} at offset 0.")
 
+    return consumer
+
+
+def _poll_messages(consumer, max_messages=100000, timeout_sec=10):
+    """
+    Poll up to max_messages from an already-configured consumer.
+    Does NOT commit -- main() commits only after the pipeline succeeds.
+
+    WHY COMMIT IS NOT HERE:
+    If commit() fires before run_pipeline(), a pipeline crash leaves Kafka's
+    offset advanced past messages that never reached ES -- permanent data loss.
+    Commit belongs in main(), after run_pipeline() returns without raising.
+    """
     messages = []
     empty_polls = 0
 
     logger.info(f"Consuming from '{KAFKA_TOPIC}' (max {max_messages} messages)...")
 
     while len(messages) < max_messages:
-        # poll(1.0) = wait up to 1 second for a message.
-        # Returns a Message object (with .value(), .key(), .error()) or None.
         msg = consumer.poll(1.0)
 
         if msg is None:
             empty_polls += 1
-            # If we've waited timeout_sec seconds with no messages, assume
-            # we've drained the topic and stop.
             if empty_polls >= timeout_sec:
                 logger.info("No more messages available. Stopping consumption.")
                 break
             continue
 
         if msg.error():
-            # KafkaError._PARTITION_EOF means we've read to the end of a
-            # partition. It's informational, not a real error.
             if msg.error().code() == KafkaError._PARTITION_EOF:
                 continue
             logger.error(f"Kafka error: {msg.error()}")
             continue
 
-        # Reset the empty poll counter since we got a real message.
         empty_polls = 0
         messages.append(msg.value().decode("utf-8"))
-
-    # commit() tells Kafka: "I've successfully processed these messages,
-    # update my group's offset so I don't re-read them next time."
-    consumer.commit()
-    consumer.close()
 
     logger.info(f"Consumed {len(messages)} messages from Kafka.")
     return messages
 
 
 # ---------------------------------------------------------------------------
-# Layer 2: Beam Pipeline — parse and write to Elasticsearch
+# Layer 2: Beam Pipeline -- parse and write to Elasticsearch
 # ---------------------------------------------------------------------------
+
+def _make_doc_id(element: dict) -> str:
+    """
+    Deterministic document ID from stable fields in the parsed document.
+
+    WHY THIS EXISTS:
+    Without an explicit _id, Elasticsearch generates a random UUID per write.
+    On re-runs (crash recovery, dev mode replays), the same source row produces
+    a new UUID -> duplicates accumulate silently in the index.
+
+    By hashing stable identifiers, the same row always produces the same _id.
+    ES upserts (overwrites) instead of inserting -- idempotent regardless of
+    how many times the pipeline replays the same data.
+
+    WHY md5 AND NOT sha256:
+    Collision resistance is irrelevant here -- this is not a security use case.
+    md5 is faster and produces a 32-char hex string vs 64 for sha256.
+    At 3.8M documents the storage difference is meaningful.
+    """
+    attrs = element.get("attributes", {})
+    source_file = element.get("source_file", "")
+
+    if element.get("log_attribute") == "network_dns":
+        key = "|".join([
+            source_file,
+            str(element.get("timestamp", "")),
+            str(attrs.get("source_ip", "")),
+            str(attrs.get("dns_query", "")),
+            str(attrs.get("dns_response_code", "")),
+        ])
+    else:
+        key = "|".join([
+            source_file,
+            str(element.get("timestamp", "")),
+            str(attrs.get("process_id", "")),
+            str(element.get("event_name", "")),
+            str(attrs.get("return_value", "")),
+            str(attrs.get("args", "")),
+        ])
+
+    return hashlib.md5(key.encode()).hexdigest()
+
 
 def clean_nan(value):
     """
@@ -154,7 +283,7 @@ def clean_nan(value):
 
     WHY THIS EXISTS:
     pandas represents missing values as float('nan'). When json.dumps()
-    serializes NaN, it writes the literal text 'NaN' — which is NOT valid JSON.
+    serializes NaN, it writes the literal text 'NaN' -- which is NOT valid JSON.
     Python's json.loads() happens to accept it (it's lenient), but Elasticsearch
     will reject documents containing NaN. So we scrub it here.
     """
@@ -177,9 +306,6 @@ class ParseLogFn(beam.DoFn):
     they'd need to be serialized too (and some things like DB connections
     can't be serialized). setup() runs AFTER the DoFn arrives at the worker,
     so it's safe to create anything there.
-
-    For our simple parsers this doesn't matter, but it's the correct habit
-    for when you later add DoFns that open ES connections or load ML models.
     """
 
     def setup(self):
@@ -190,20 +316,15 @@ class ParseLogFn(beam.DoFn):
         }
 
     def process(self, element):
-        """
-        Takes a raw Kafka message (Python dict with 'log_type' and 'raw'),
-        routes it to the correct parser, yields the cleaned result.
-        """
         log_type = element.get("log_type")
         raw_data = element.get("raw", {})
 
         parser = self.parsers.get(log_type)
         if parser is None:
             logger.warning(f"Unknown log_type: '{log_type}'. Skipping message.")
-            return  # yield nothing — message is dropped, pipeline continues
+            return
 
         parsed = parser.parse(raw_data)
-        # Attach the source metadata so we can trace where this doc came from.
         parsed["source_file"] = element.get("source_file", "unknown")
         yield parsed
 
@@ -212,18 +333,10 @@ class WriteToEs(beam.DoFn):
     """
     Beam DoFn that bulk-writes documents to Elasticsearch.
 
-    WHY A DoFn AND NOT beam.Map():
-    We need setup() to create the ES client once per worker, and we need
-    to batch documents for efficient bulk writes. Beam's bundling mechanism
-    groups elements before calling process(), but we want explicit control
-    over the bulk size for ES.
-
     WHY setup()/teardown() FOR THE ES CLIENT:
     The Elasticsearch client holds a persistent HTTP connection pool. Creating
     it once in setup() and reusing it across all process() calls is efficient.
-    teardown() doesn't strictly need to close it (Python GC handles it), but
-    it's good practice — especially when this DoFn eventually runs on Flink
-    with long-lived workers.
+    teardown() closes it after all elements are processed.
     """
 
     def setup(self):
@@ -234,6 +347,7 @@ class WriteToEs(beam.DoFn):
     def process(self, element):
         action = {
             "_index": ES_INDEX_NAME,
+            "_id": _make_doc_id(element),
             "_source": element,
         }
         self.buffer.append(action)
@@ -243,10 +357,8 @@ class WriteToEs(beam.DoFn):
 
     def finish_bundle(self):
         """
-        Called by Beam after it finishes sending a batch of elements to process().
-        This ensures any leftover documents in the buffer get written to ES.
-        Without this, the last partial batch (e.g., 200 docs when bulk_size=500)
-        would be lost.
+        Flush remaining documents after Beam stops calling process().
+        Without this, the last partial batch would be silently lost.
         """
         self._flush()
 
@@ -269,7 +381,7 @@ def run_pipeline(messages):
     Build and execute the Beam pipeline.
 
     DirectRunner runs everything locally in one process. When you move
-    to Flink, you change PipelineOptions and the Kafka consumption layer —
+    to Flink, you change PipelineOptions and the Kafka consumption layer --
     the DoFns (ParseLogFn, WriteToEs) stay identical.
     """
     options = PipelineOptions(runner="DirectRunner")
@@ -277,18 +389,10 @@ def run_pipeline(messages):
     with beam.Pipeline(options=options) as p:
         (
             p
-            # beam.Create() takes a Python list and turns it into a PCollection.
-            # Each string in the list becomes one element in the pipeline.
             | "Inject messages" >> beam.Create(messages)
-
-            # Parse each JSON string into a Python dict.
-            # clean_nan is applied first to handle NaN values from pandas.
             | "Parse JSON" >> beam.Map(lambda raw: clean_nan(json.loads(raw)))
-
-            # Route each dict to the correct parser based on log_type.
             | "Transform logs" >> beam.ParDo(ParseLogFn())
-
-            # Write parsed documents to Elasticsearch.
+            | "Extract features" >> beam.Map(extract_features)
             | "Write to ES" >> beam.ParDo(WriteToEs())
         )
 
@@ -300,15 +404,36 @@ def run_pipeline(messages):
 # ---------------------------------------------------------------------------
 
 def main():
-    # Layer 1: Pull messages from Kafka
-    messages = consume_from_kafka(max_messages=10000, timeout_sec=10)
+    consumer = _build_consumer()
+    total_processed = 0
+    run_count = 0
 
-    if not messages:
-        logger.info("No messages to process. Exiting.")
-        return
+    try:
+        while True:
+            run_count += 1
+            logger.info(f"--- Ingest run {run_count} ---")
 
-    # Layer 2: Process through Beam and write to ES
-    run_pipeline(messages)
+            messages = _poll_messages(consumer, max_messages=100000, timeout_sec=10)
+
+            if not messages:
+                logger.info(
+                    f"Topic exhausted after {run_count - 1} runs. "
+                    f"Total documents written: {total_processed:,}."
+                )
+                break
+
+            run_pipeline(messages)
+
+            # Commit AFTER the pipeline succeeds. If run_pipeline() raises,
+            # the exception propagates past this line -- Kafka re-delivers on
+            # next startup, restoring at-least-once delivery semantics.
+            consumer.commit()
+            total_processed += len(messages)
+            logger.info(f"Run {run_count} complete. {total_processed:,} total documents processed so far.")
+    finally:
+        # Runs whether we exited cleanly or via exception -- consumer is always
+        # closed so Kafka can trigger a rebalance and reassign our partitions.
+        consumer.close()
 
 
 if __name__ == "__main__":

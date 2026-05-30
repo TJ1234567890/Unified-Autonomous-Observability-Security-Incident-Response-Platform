@@ -87,6 +87,13 @@ This is NOT a standard assistant relationship. It is a strict mentorship. Do not
 
 9. **Never give just one way to understand something.** Give the concept, then give an analogy, then explain what breaks if you get it wrong. The user learns best when they see why the correct answer matters.
 
+### Confirmed Teaching Style Preferences (from explicit user feedback this session)
+
+- **One question at a time.** Ask a question, wait for the answer, walk through it fully, then move to the next. Do NOT dump a list of questions.
+- **State the question count upfront.** Before starting a quiz, tell the user how many questions are coming (e.g., "I have N questions"). This gives them a sense of scope.
+- **Re-quiz wrong answers at the end.** After finishing all questions, circle back to every wrong answer and re-ask it to confirm the concept landed.
+- **Predetermine the set, not an arbitrary cap.** The user said "do an arbitrary number but enough to cover everything." Cover all teachable concepts from the file/change. Don't stop early.
+
 ### Observed Patterns in the User's Thinking (from quiz history — use to calibrate)
 
 - **Tends to answer HOW without WHY.** Example: when asked why `flush()` exists, initially answered "it clears the buffer" without explaining the process-exit race condition it prevents. Improved with coaching.
@@ -303,9 +310,25 @@ confluent kafka topic consume security.logs.raw --from-beginning
 ### Python Environment
 
 - **Version:** Python 3.9.6. Needs upgrade to 3.10+ — Apache Beam's GCP dependencies emit FutureWarnings on 3.9.
-- **Virtual environment:** `.venv/` directory in project root. Gitignored.
+- **Virtual environment:** `.venv/` directory in project root. Gitignored. **EXISTS on both Mac and Windows.**
+- **Windows Python path:** `.venv\Scripts\python.exe` (backslash, not forward slash)
+- **Mac Python path:** `.venv/bin/python`
 - **Install:** `pip install -r requirements.txt` from project root.
-- **Requirements include:** `confluent-kafka`, `pandas`, `python-dotenv`, `elasticsearch`, `fastapi`, `uvicorn`, `apache-beam[gcp]`, `pytest`
+- **Requirements include:** `confluent-kafka`, `pandas`, `python-dotenv`, `elasticsearch>=8.0.0,<9.0.0`, `fastapi`, `uvicorn`, `apache-beam[gcp]`, `pytest`
+- **CRITICAL — elasticsearch client must be pinned to <9.0.0.** The local Docker server is Elasticsearch 8.11.0. The v9 Python client sends `Accept: compatible-with=9` which the server rejects with `BadRequestError(400, media_type_header_exception)`. If `pip install elasticsearch` installs v9+, immediately downgrade: `pip install "elasticsearch>=8.0.0,<9.0.0"`
+
+### Windows-Specific Setup (NEW — Windows desktop machine)
+
+**Python execution policy:** Must be set once: `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
+
+**CRITICAL — Never use PowerShell `Set-Content -Encoding utf8` for Python files.** PowerShell 5.1 adds a UTF-8 BOM (`\xef\xbb\xbf`) to the start of the file. Python's parser fails with `SyntaxError: invalid non-printable character U+FEFF`. Use the Write/Edit tools (which write clean UTF-8 without BOM) or `.NET UTF8Encoding(false)` for any `.env` writes:
+```powershell
+[System.IO.File]::WriteAllText($path, $content, [System.Text.UTF8Encoding]::new($false))
+```
+
+**Non-ASCII characters in Python docstrings:** The original `ingestor.py` was written on Mac with em dashes (—) and arrows (→) in docstrings. These are valid UTF-8 but cause `SyntaxError: invalid character` on Windows when the file has encoding issues. All docstrings have been rewritten to pure ASCII (-- for em dash, -> for arrow) as of this session. Do not re-introduce Unicode characters in Python source files.
+
+**Miniconda is installed** but packages live in the project `.venv`, NOT in the Miniconda base env. Always use `.venv\Scripts\python.exe`, not `conda run` or the system Python.
 
 ### Credentials (.env file — NEVER COMMITTED, NEVER PUSH THIS)
 
@@ -531,9 +554,11 @@ Output structure:
 }
 ```
 
-**DeepKernelParser:** Input has lowercase column names. Includes kernel-specific fields: `thread_id`, `mount_namespace`, `stack_addresses`. Converts float timestamp to string.
+**DeepKernelParser:** Input has lowercase column names. Includes kernel-specific fields: `thread_id`, `mount_namespace`, `stack_addresses`. Converts float timestamp to string. **UPDATED (Windows session):** also parses `args_num` and `args` fields — these existed in the CSV but were silently dropped before. Default is `None` for both.
 
-**StandardHostParser:** Same as DeepKernelParser but WITHOUT `thread_id`, `mount_namespace`, `stack_addresses`. Those fields don't exist in `*_host.csv` files.
+**StandardHostParser:** Same as DeepKernelParser but WITHOUT `thread_id`, `mount_namespace`, `stack_addresses`. **UPDATED (Windows session):** also parses `args_num` and `args` fields with default `None`.
+
+**Why `None` not `""` or `0` for args/args_num:** `""` causes ES type mapping conflicts if ES inferred the field as non-string. `0` is a valid argsNum value. `None` = JSON `null` = unambiguously absent.
 
 **Bug found by tests and fixed:**
 `DnsParser` had `row.get("DnsResponseCode", "")` — default was empty string `""`.
@@ -543,9 +568,67 @@ Why not `0`? Because `0` is a valid DNS response code meaning NOERROR. Using `0`
 
 ### `tools/dataset-ingestor/ingestor.py`
 
+**MAJOR REFACTOR (Windows session) — architecture changed significantly from original.**
+
 Two-layer architecture:
 - Layer 1: confluent-kafka consumer reads messages from Kafka into a Python list
 - Layer 2: Apache Beam pipeline takes that list and transforms and writes to Elasticsearch
+
+**CRITICAL BUG FIXED — commit was before pipeline (data loss):**
+The original code called `consumer.commit()` inside `consume_from_kafka()` before returning. `run_pipeline()` ran after. If the pipeline crashed, Kafka's offset was already advanced — those messages were permanently lost. Fixed by splitting into `_build_consumer()` + `_poll_messages()` (no commit inside) and moving `consumer.commit()` to `main()` AFTER `run_pipeline()` succeeds.
+
+**NEW FUNCTION: `_build_consumer()`**
+Creates and configures the Kafka consumer once. Called once in `main()` — not once per batch. The consumer stays alive across all 39 polling loops so partition assignment and rebalance happen only once. Returns the consumer object.
+
+**NEW FUNCTION: `_poll_messages(consumer, max_messages, timeout_sec)`**
+Takes an already-configured consumer. Polls up to `max_messages` messages. Does NOT commit. Returns the message list. The commit belongs in `main()` after the pipeline succeeds.
+
+**NEW FUNCTION: `_make_doc_id(element)`**
+Generates a deterministic MD5 hash from stable fields in the parsed document. This prevents duplicate documents when the pipeline re-runs (crash recovery, dev mode replay).
+- For DNS: hashes `source_file + timestamp + source_ip + dns_query + dns_response_code`
+- For kernel/host: hashes `source_file + timestamp + process_id + event_name + return_value + args`
+Why MD5 not SHA256: collision resistance is irrelevant here (not a security use case). MD5 is faster, 32-char hex vs 64. At 3.8M docs the difference matters.
+
+**`WriteToEs.process()` now includes `_id`:**
+```python
+action = {
+    "_index": ES_INDEX_NAME,
+    "_id": _make_doc_id(element),   # deterministic — same data = same ID = ES upserts
+    "_source": element,
+}
+```
+ES upserts (overwrites) when the same `_id` arrives again. Identical data, same result. Idempotent.
+
+**NEW: `extract_features` step in pipeline (added this session):**
+Between `ParseLogFn` and `WriteToEs`, a `beam.Map(extract_features)` step computes ML-ready features and nests them under a `features` key in every document. Uses `beam.Map` not `beam.ParDo` because it's a pure 1-to-1 transform with no lifecycle needs.
+
+Features extracted:
+- DNS: `feat_dns_query_length`, `feat_dns_query_entropy` (Shannon entropy for DGA detection), `feat_dns_num_subdomains`, `feat_dns_failed`
+- Kernel/host: `feat_is_root_user`, `feat_return_failed`, `feat_args_length`, `feat_args_has_shell`, `feat_args_has_network`, `feat_args_has_sensitive_path`, `feat_event_category` (process_exec/file_access/network/memory/other)
+
+**Regex patterns compiled at module load, not per-call:**
+`_SHELL_RE`, `_NETWORK_RE`, `_SENSITIVE_PATH_RE` are module-level constants. `re.compile()` is called once when the file loads. Every `extract_features()` call reuses the compiled pattern object. This is the correct pattern for high-volume pipelines — compiling regex on every document would be wasteful.
+
+**`main()` — new structure with try/finally:**
+```python
+def main():
+    consumer = _build_consumer()       # once
+    try:
+        while True:
+            messages = _poll_messages(consumer, max_messages=100000, timeout_sec=10)
+            if not messages:
+                break
+            run_pipeline(messages)     # ES write first
+            consumer.commit()          # offset advances only after success
+            total_processed += len(messages)
+    finally:
+        consumer.close()               # always runs, even on exception
+```
+
+Why `try/finally` instead of just calling `close()` at the end: if `run_pipeline()` raises an unhandled exception, Python exits the `try` block immediately, skips `consumer.commit()` (correct — we want re-delivery), and then `finally` fires. `consumer.close()` runs unconditionally. Kafka triggers a rebalance and reassigns the partitions. Without `finally`, a crash would leave the consumer connection open until Kafka's session timeout (~45 sec), blocking other workers from getting those partitions.
+
+**Current group.id = "beam-ingestor-v2":**
+The original group (`beam-ingestor`) committed ~100k offsets during a failed run (elasticsearch client v9 crash). ES was empty. Switching to `beam-ingestor-v2` gave a fresh group with no committed offsets, so `auto.offset.reset = "earliest"` kicked in and the full 3.8M were re-read cleanly. If you need another fresh start, increment to `beam-ingestor-v3`.
 
 **Logging setup:**
 ```python
@@ -591,7 +674,14 @@ Why `assign()` was added after trying `subscribe()` for dev mode: Even after `su
 **Group ID debugging history — important context:** During the debugging session where the production consumer was returning 0 messages, multiple `group.id` values were tried in sequence (`beam-ingestor-v1`, `beam-ingestor-v2`, `beam-ingestor-v3`) to try to get a "fresh" consumer group with no committed offsets, hoping that would force a read from the beginning. This did not solve the problem. The real issue was that calling `seek()` to `OFFSET_BEGINNING` immediately after `subscribe()` was unreliable — librdkafka hadn't initialized partition fetch state by the time seek was called, so the seek had no effect. Changing group IDs was a red herring. The actual fix was switching dev mode to `assign()` + `OFFSET_BEGINNING`, which bypasses the group protocol entirely and always seeks to offset 0 with no race condition.
 
 **Consumer max message limit:**
-The consumer polls for messages up to a configured maximum (10,000 messages) before stopping. After hitting that limit OR after a timeout with no new messages arriving, it stops polling and passes everything collected to the Beam pipeline. This is why the logs show `INFO:__main__:No more messages available. Stopping consumption.` — the topic was empty (caught up to the latest offset) and the timeout expired.
+The consumer polls for messages up to a configured maximum (100,000 messages per batch) before stopping. After hitting that limit OR after a timeout with no new messages arriving, it stops and returns. `main()` loops back and calls `_poll_messages()` again for the next batch. This continues until the topic is exhausted (0 messages returned). The ingest of all 3.8M BETH messages required 39 batches.
+
+**VERIFIED COMPLETE INGEST (Windows session):**
+- 3,809,617 messages were in Kafka (confirmed via watermark offsets)
+- 39 runs × ~100k messages = 3,808,809 total consumed
+- 3,807,980 documents in ES after deduplication via deterministic IDs
+- 829 difference: rows where ParseLogFn dropped unknown log_types, or rows with identical key fields that upserted instead of inserting
+- Verified: `Invoke-RestMethod -Uri "http://localhost:9200/beth-security-logs/_count"` returns 3,807,980
 
 **`clean_nan()` function:**
 Recursively walks a nested dict/list and replaces `float('nan')` and `float('inf')` with `None`.
@@ -654,6 +744,16 @@ class WriteToEs(beam.DoFn):
 **Why `_flush()` is a separate helper method (DRY principle):** Both `process()` (triggered when buffer hits 500) and `finish_bundle()` (triggered at end of bundle) need to run the exact same bulk write logic — check if buffer is non-empty, call `helpers.bulk()`, clear the buffer. Without `_flush()`, you'd copy-paste that logic into two places. If you later need to add retry logic, error handling, or logging to the flush operation, you'd have to change it in two places and risk them diverging. `_flush()` puts the logic in one place so both callers share it. This is called the DRY principle: Don't Repeat Yourself.
 
 `teardown()` runs after all elements have been processed and all bundles are done. It is the cleanup method — any resource opened in `setup()` should be closed here. The ES client connection is closed here.
+
+**Concepts added this session (Windows):**
+- `try/finally` in Python: `finally` runs unconditionally — normal exit, `break`, or unhandled exception. `consumer.commit()` is skipped on exception (Kafka re-delivers). `consumer.close()` in `finally` always fires (Kafka triggers rebalance immediately).
+- At-least-once vs at-most-once: at-least-once = commit AFTER successful write (possible duplicates, no data loss). At-most-once = commit BEFORE write (no duplicates, possible data loss on crash). Original code had at-most-once. Fixed to at-least-once. Exactly-once requires atomic commits across both systems.
+- Consumer group partition exclusivity: each partition is owned by EXACTLY ONE consumer at a time within a group. 2 consumers + 3 partitions = [0,1] to one, [2] to the other. Same message never seen by two workers.
+- Rebalance protocol: triggered when consumer joins/leaves group. All consumption stops. Group coordinator redistributes partitions. Warmup loop waits for rebalance to complete.
+- Shannon entropy: measures how uniformly distributed characters are. Low entropy = one char dominates (predictable). High entropy = all chars roughly equal (random — DGA pattern). Threshold ~3.5 bits for malware. Weakness: long English domains bypass it.
+- Idempotency: same operation applied N times = same result as applying it once. ES upsert with deterministic `_id` is idempotent.
+- DRY principle: `_flush()` helper prevents two copies of bulk write logic from diverging in 6 months.
+- `return parsed` vs `yield parsed` in DoFn: `return parsed` makes Beam iterate over the dict — Python dict iteration yields the KEYS (strings like "timestamp"), each becoming a downstream element. Downstream step receives "timestamp" as input and crashes. Always `yield` in `process()`.
 
 `helpers.bulk()` from `elasticsearch` library: sends all documents in `self.buffer` to ES in a single HTTP request instead of one request per document. Much faster. `raise_on_error=False` means individual document failures are logged but don't crash the pipeline.
 
@@ -773,6 +873,12 @@ post any further updates to google.api_core supporting this Python version.
 | `dns_response_code` default = `None` | Not `""`, not `0` | `""` causes ES mapping conflict; `0` silently misrepresents missing data as NOERROR |
 | Topic name is permanent | `security.logs.raw` cannot be renamed | Kafka has no rename; delete + recreate is the only path |
 | `dev` mode uses `assign()` not `auto.offset.reset` | Bypass group protocol entirely | `auto.offset.reset` only fires when no committed offset exists; `assign()` always resets |
+| **Commit after pipeline, not before** | `consumer.commit()` in `main()` after `run_pipeline()` | Original code committed inside `consume_from_kafka()` before the pipeline ran — pipeline crash = data loss with no recovery |
+| **Deterministic ES doc IDs** | MD5 hash of stable fields via `_make_doc_id()` | Random UUIDs cause duplicates on every re-run. Deterministic IDs make writes idempotent |
+| **Consumer built once in main()** | `_build_consumer()` called once, `_poll_messages()` loops | Building consumer per batch triggers rebalance every 100k messages — O(1) vs O(N) rebalances |
+| **try/finally for consumer.close()** | `finally` block in `main()` always closes consumer | Without it, a crash leaves the connection open until Kafka's ~45 sec session timeout, blocking rebalance |
+| **elasticsearch client pinned <9.0.0** | `pip install "elasticsearch>=8.0.0,<9.0.0"` | v9 client sends `compatible-with=9`, rejected by ES 8.11.0 server with 400 error |
+| **group.id = "beam-ingestor-v2"** | Fresh group after failed v1 run | Original group committed 100k offsets during failed run (ES crash). New group = no committed offsets = full replay from offset 0 |
 
 ---
 
@@ -847,6 +953,28 @@ The user has been quizzed on and has demonstrated understanding of all of the fo
 
 Use this to calibrate where to probe vs. where to trust. Do not re-teach things the user has solidly demonstrated. Do probe things where they were shaky or wrong.
 
+### Windows Session Quiz Results (added to existing history)
+
+**Solidly understood first try (Windows session):**
+- Consumer group partition exclusivity: each partition owned by exactly one consumer, never both
+- `beam.Map` vs `beam.ParDo`: Map for 1-to-1 pure functions; ParDo for lifecycle/variable output
+- `setup()` vs inline instantiation: 3.8M object creations (inline) vs once per worker (setup)
+- `finish_bundle()` lifecycle: fires after all `process()` calls for the bundle, before teardown
+- DRY principle: `_flush()` helper prevents diverging copies 6 months later
+- Shannon entropy concept: uniform character distribution = high entropy = DGA signal
+- Single-feature limits: low entropy domain can still be C2; need frequency + age + response
+- `try/finally`: commit skipped on exception (correct), close always fires (correct)
+
+**Got wrong or shaky (Windows session):**
+
+**Commit timing (wrong: "99,999 messages"):** Said the 100,000th message triggers the commit. Wrong — `commit()` is outside the loop, fires after the loop exits by any means. Max re-delivered on crash is 100,000, not 99,999. The loop exit condition is irrelevant to commit timing.
+
+**Data loss bug (missed entirely on first pass):** Did not identify that `commit()` fires inside `consume_from_kafka()` BEFORE `run_pipeline()`. If pipeline crashes: Kafka offset advanced, ES empty = permanent data loss. This is at-most-once delivery. The fix: `commit()` in `main()` AFTER `run_pipeline()` succeeds.
+
+**`return parsed` vs `yield parsed` (wrong mechanism):** Said "ParDo expects yield" and "return throws an error." Wrong mechanism. `return parsed` (a dict) causes Beam to iterate over it. Python dict iteration yields the KEYS ("timestamp", "log_attribute", etc.) as individual strings. Each string becomes a downstream element. The downstream `extract_features` step calls `.get()` on a string — AttributeError. Not a "generator error" — it's dict key iteration causing wrong-type elements.
+
+**`finish_bundle()` (wrong reason for loss):** Said "Beam stops calling `process()` because the buffer limit (500) wasn't hit." Wrong — Beam calls `process()` on every element regardless of your internal buffer. Beam doesn't know about your buffer. Beam stops calling `process()` because it's done with all elements in the bundle. Without `finish_bundle()`, Beam goes straight to `teardown()` and the 300-doc buffer is garbage collected.
+
 ### Solidly Understands
 
 - Why producers don't need `group.id` or `auto.offset.reset` (correctly explained)
@@ -904,8 +1032,18 @@ Use this to calibrate where to probe vs. where to trust. Do not re-teach things 
 
 ## SECTION 12: FULL PROJECT PHASE ROADMAP
 
-### Phase 1 — Data Spine ✅ COMPLETE
-CSV → Kafka → Beam → Elasticsearch. 24 parser tests passing. Bug found and fixed. ES has 807 documents.
+### Phase 1 — Data Spine ✅ COMPLETE (with Windows session improvements)
+CSV → Kafka → Beam → Elasticsearch. 24 parser tests passing.
+
+**Original completion (Mac):** 807 documents, basic pipeline working.
+
+**Windows session improvements:**
+- parsers.py: added `args_num` and `args` fields to DeepKernelParser and StandardHostParser
+- ingestor.py: complete refactor — `_build_consumer()` + `_poll_messages()` + `_make_doc_id()`, commit after pipeline, try/finally
+- Feature extraction step added to pipeline (`extract_features` via `beam.Map`)
+- elasticsearch client pinned to <9.0.0
+- All 15 BETH CSV files produced to Kafka (3,809,617 messages across 3 partitions)
+- Full ingest complete: **3,807,980 documents in `beth-security-logs`**
 
 ### Phase 2A — FastAPI `/search` Endpoint (NEXT)
 
@@ -1016,7 +1154,7 @@ eBPF programs are compiled to BPF bytecode and loaded into the Linux kernel. Req
 
 | Issue | Impact | Planned Fix |
 |---|---|---|
-| Duplicate ES documents on re-run | 807 docs from one 269-row CSV after 3 dev-mode runs | Deterministic doc ID: hash of `source_file + row_index` |
+| ~~Duplicate ES documents on re-run~~ | **FIXED** — `_make_doc_id()` generates deterministic MD5 IDs. ES upserts on re-run. | Implemented in Windows session |
 | Python 3.9.6 | FutureWarnings and `importlib.metadata` errors from Beam's GCP dependencies | Upgrade to Python 3.10 or 3.11 |
 | Beam WARNING: yield+return mixing | Warning only, behavior is correct | Acceptable; refactor if it causes real issues |
 | Beam WARNING: no iterator in WriteToEs | Warning only, terminal sink doesn't yield | Acceptable |
@@ -1025,6 +1163,9 @@ eBPF programs are compiled to BPF bytecode and loaded into the Linux kernel. Req
 | ES data lost if Docker volume deleted | `docker volume rm es_data` destroys all data; normal container restarts are safe | Volume `es_data` already in docker-compose.yml — do not delete the volume |
 | Confluent CLI not documented in repo | New machines need manual CLI setup | Add to SETUP.md or README |
 | ES running in local Docker | Not production-grade | Migrate to Elastic Cloud (paid) when project scales |
+| elasticsearch Python client must be <9.0.0 | v9 client incompatible with ES 8.11.0 server (400 error) | Pin in requirements.txt: `elasticsearch>=8.0.0,<9.0.0` |
+| Beam 2.73.0 uses PrismRunner not DirectRunner | PrismRunner downloads a binary (~100MB) on first run | One-time download. Cached at `C:\Users\tejes\.apache_beam\cache\prism\`. Pipeline works correctly. |
+| group.id = "beam-ingestor-v2" | v1 group committed offsets during failed run — do not reuse | If another fresh start is needed, increment to beam-ingestor-v3 |
 | Pipeline is batch not true streaming | All messages collected before processing begins | Switch to a proper streaming source (Beam KafkaIO) in later phases |
 | `CONSUMER_MODE = production` in `.env` | New dev machine will resume from last committed offset (correct behavior, but may confuse) | Switch to `dev` for local-only testing; use `production` when running multi-worker |
 | Terraform not yet implemented | Cloud infra provisioned manually | Add Terraform configs in a future phase for Confluent, Elastic Cloud, AWS/GCP resources |

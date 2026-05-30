@@ -42,7 +42,9 @@ class DeepKernelParser(Parser):
                 # Deep Kernel Specific Features
                 "thread_id": row.get("threadId", ""),
                 "mount_namespace": row.get("mountNamespace", ""),
-                "stack_addresses": row.get("stackAddresses", "")
+                "stack_addresses": row.get("stackAddresses", ""),
+                "args_num": row.get("argsNum", None),
+                "args": row.get("args", None)
             },
             "labels": {
                 "sus": row.get("sus", 0),
@@ -62,11 +64,13 @@ class StandardHostParser(Parser):
                 "process_id": row.get("processId", ""),
                 "parent_process_id": row.get("parentProcessId", ""),
                 "process_name": row.get("processName", ""),
-                "user_id": row.get("userId", "")
+                "user_id": row.get("userId", ""),
+                "args_num": row.get("argsNum", None),
+                "args": row.get("args", None)
             },
             "labels": {
                 "sus": row.get("sus", 0),
                 "evil": row.get("evil", 0)
             }
         }
-        
+
