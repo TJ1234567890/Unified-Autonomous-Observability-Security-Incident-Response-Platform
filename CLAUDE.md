@@ -1033,6 +1033,20 @@ Use this to calibrate where to probe vs. where to trust. Do not re-teach things 
 ## SECTION 12: FULL PROJECT PHASE ROADMAP
 
 ### Phase 1 — Data Spine ✅ COMPLETE (with Windows session improvements)
+
+**WINDOWS ACTION REQUIRED — Re-ingest to get `log_type` field:**
+`ParseLogFn` was updated (Mac session) to write `log_type` into every ES document. The Windows machine's 3,807,980 documents do NOT have this field — they were written before this fix. The search API filters on `log_type`, so those documents will return 0 results for type-based queries until re-ingested. To fix on Windows:
+```bash
+# 1. Delete the stale index
+curl -X DELETE http://localhost:9200/beth-security-logs
+
+# 2. All 15 CSVs are already in Kafka (beam-ingestor-v2 group committed offsets).
+#    Increment group ID in ingestor.py line 172 to force a fresh read:
+#    "group.id": "beam-ingestor-v3"
+
+# 3. Run the ingestor — it will re-read all 3.8M messages from Kafka offset 0
+python tools/dataset-ingestor/ingestor.py
+```
 CSV → Kafka → Beam → Elasticsearch. 24 parser tests passing.
 
 **Original completion (Mac):** 807 documents, basic pipeline working.

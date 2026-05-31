@@ -326,6 +326,7 @@ class ParseLogFn(beam.DoFn):
 
         parsed = parser.parse(raw_data)
         parsed["source_file"] = element.get("source_file", "unknown")
+        parsed["log_type"] = log_type
         yield parsed
 
 
