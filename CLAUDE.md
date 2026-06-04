@@ -399,6 +399,15 @@ Unified-Autonomous-Observability-Security-Incident-Response-Platform/
 │   ├── genai-gateway/                 ← EMPTY — Phase 4 service (LLM traffic gateway)
 │   └── incident-orchestrator/         ← EMPTY — Phase 5 service (incident copilot)
 │
+├── services/
+│   ├── search-api/                    ← Phase 2A COMPLETE — search API lives here
+│   │   ├── main.py                    ← FastAPI app, /health and /search routes
+│   │   ├── models.py                  ← Pydantic SearchRequest and SearchResponse models
+│   │   └── search.py                  ← ES query builder and executor
+│   ├── context-retrieval/             ← EMPTY — Phase 3 service (vector search)
+│   ├── genai-gateway/                 ← EMPTY — Phase 4 service (LLM traffic gateway)
+│   └── incident-orchestrator/         ← EMPTY — Phase 5 service (incident copilot)
+│
 └── tools/
     └── dataset-ingestor/              ← Phase 1 COMPLETE — all active code lives here
         ├── config.py                  ← Kafka + ES config, loads .env
@@ -808,6 +817,146 @@ Lambdas are used for short one-liner functions that don't need a name because th
 
 ---
 
+## SECTION 7B: WHAT HAS BEEN BUILT — PHASE 2A COMPLETE
+
+Phase 2A goal: HTTP search API backed by Elasticsearch. Three files in `services/search-api/`.
+
+**IMPORTANT — `log_type` field added to `ParseLogFn` (Mac session):**
+During Phase 2A, a critical schema gap was discovered: `ParseLogFn` extracted `log_type` from the Kafka message envelope to pick the right parser but never wrote it into the ES document. Every document was missing `log_type`. The search API filtered on `log_type` and returned 0 results. Fix: added `parsed["log_type"] = log_type` to `ParseLogFn.process()` in `ingestor.py`.
+
+Why `source_file` cannot replace `log_type`: `source_file` encodes type in the filename (e.g. `"-dns"` substring). You could derive the type from it at query time using wildcard/regex matching. But this is wrong for three reasons:
+1. ES wildcard queries bypass the inverted index and scan every document — not cached, slow.
+2. Every consumer (ML model, copilot, dashboards) would have to re-implement the same filename parsing logic independently.
+3. It creates a hidden dependency on filename conventions. If a file is ever named differently, filtering silently breaks.
+Rule: derive once at write time, store the clean result, query the clean field. `source_file` is provenance (where the data came from). `log_type` is type metadata (what the data is). Both belong in the document, for different reasons.
+
+**Windows re-ingest required:** The Windows 3,807,980 documents were written before this fix and have no `log_type` field. They are useless for type-based search queries until re-ingested. See Phase 1 section for exact steps.
+
+### `services/search-api/models.py`
+
+Defines the shape of every request and response using Pydantic. Pydantic is a Python library that validates data types at runtime — if a caller sends `sus: "yes"` instead of `sus: 1`, Pydantic rejects it with a clear 422 error before the query even reaches Elasticsearch.
+
+```python
+class SearchRequest(BaseModel):
+    log_type: Optional[Literal["dns", "deep_kernel", "standard_host"]] = None
+    sus: Optional[Literal[0, 1]] = None
+    evil: Optional[Literal[0, 1]] = None
+    host_name: Optional[str] = None
+    process_name: Optional[str] = None
+    dns_query: Optional[str] = None
+    timestamp_from: Optional[str] = Field(None, example="2021-05-16T00:00:00Z")
+    timestamp_to: Optional[str] = Field(None, example="2021-05-17T00:00:00Z")
+    page: int = Field(1, ge=1)
+    page_size: int = Field(20, ge=1, le=500)
+
+class SearchResponse(BaseModel):
+    total: int
+    page: int
+    page_size: int
+    took_ms: int
+    hits: list[Hit]
+```
+
+`Literal["dns", "deep_kernel", "standard_host"]` — Pydantic enforces at the API boundary that only these three strings are valid. Any other value returns a 422 before touching ES. `Optional[...]` means the field can be omitted entirely (defaults to `None`). `ge=1` means "greater than or equal to 1" — enforces that page and page_size are positive integers. `le=500` caps page_size at 500 to prevent callers from accidentally requesting millions of documents in one hit.
+
+`Hit` model contains `id` (ES document `_id`), `score` (relevance score — `None` when only filters are applied), and `source` (the full `_source` dict).
+
+### `services/search-api/search.py`
+
+Contains `build_query()` and `execute_search()`. This is where the `filter` vs `must` decision lives in actual code.
+
+```python
+def build_query(req: SearchRequest) -> dict:
+    filters = []
+    must = []
+
+    # Exact-match conditions → filter (no scoring, cached by ES)
+    if req.log_type:
+        filters.append({"term": {"log_type": req.log_type}})
+    if req.sus is not None:
+        filters.append({"term": {"labels.sus": req.sus}})
+    if req.evil is not None:
+        filters.append({"term": {"labels.evil": req.evil}})
+    if req.host_name:
+        filters.append({"term": {"attributes.host_name.keyword": req.host_name}})
+    if req.timestamp_from or req.timestamp_to:
+        range_clause = {}
+        if req.timestamp_from: range_clause["gte"] = req.timestamp_from
+        if req.timestamp_to:   range_clause["lte"] = req.timestamp_to
+        filters.append({"range": {"timestamp": range_clause}})
+
+    # Full-text condition → must (scores by relevance, best matches ranked first)
+    if req.dns_query:
+        must.append({"match": {"attributes.dns_query": req.dns_query}})
+
+    if not filters and not must:
+        return {"match_all": {}}
+
+    bool_clause = {}
+    if filters: bool_clause["filter"] = filters
+    if must:    bool_clause["must"] = must
+    return {"bool": bool_clause}
+```
+
+**`filter` vs `must` — the most important ES performance decision in this file:**
+- `filter`: condition must match, ES does ZERO relevance scoring. Result is cached — same filter on same data always returns the same set of document IDs, so ES stores it and skips recomputation on the next request. Use for exact matches where relevance doesn't matter: booleans, enums, keyword fields, time ranges.
+- `must`: condition must match, AND ES calculates a BM25 relevance score for it. Not cached. Use for full-text search where you want the closest matches ranked first.
+- `log_type`, `sus`, `evil`, `host_name`, time ranges → all go in `filter`. A document either has `sus=1` or it doesn't. There is no "how much" does it have `sus=1`. Scoring would be meaningless and CPU-wasting.
+- `dns_query` free-text search → goes in `must`. "Show me queries that look like `amazonaws.com`" — relevance matters, closest matches should rank highest.
+
+**`{"term": {"log_type": "dns"}}` vs `{"match": {"attributes.dns_query": "..."}}` distinction:**
+- `term` query — exact match on a keyword field. No text analysis, no tokenization. The value must match exactly as stored. Used for enums, IDs, labels.
+- `match` query — full-text search with text analysis (tokenization, lowercasing, stemming). Used when you want ES to find documents that are "about" the query text, not an exact literal match.
+
+**`.keyword` suffix on string fields (`host_name.keyword`):**
+ES automatically creates two sub-fields for text fields: the analyzed field (for `match` queries) and a `.keyword` field (raw, unanalyzed, for `term` and exact-match queries). Using `term` on a text field without `.keyword` fails because the stored value is tokenized. `host_name.keyword` gives you the exact unmodified string.
+
+**Pagination:** `from_offset = (page - 1) * page_size`. Page 1 = offset 0. Page 2 = offset 20 (with default page_size 20). ES `from_` parameter skips that many documents before returning results.
+
+**`track_total_hits=True`:** By default ES caps the total count at 10,000 for performance. Setting this to `True` forces an exact count regardless of how many documents match. Required if you want to show "3,807,980 results" accurately.
+
+### `services/search-api/main.py`
+
+FastAPI app that wires the models and search logic together.
+
+```python
+app = FastAPI(title="Security Log Search API", version="1.0.0")
+es_client = Elasticsearch(ES_URL)
+
+@app.get("/health")
+def health():
+    if not es_client.ping():
+        raise HTTPException(status_code=503, detail="Elasticsearch unreachable")
+    return {"status": "ok", "es_url": ES_URL, "index": ES_INDEX}
+
+@app.post("/search", response_model=SearchResponse)
+def search(req: SearchRequest):
+    try:
+        return execute_search(es_client, ES_INDEX, req)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+```
+
+**Why `es_client` is module-level (not created per request):** Creating an Elasticsearch client opens a connection pool to the server. If you created it inside the `search()` function, every single HTTP request would open a new connection pool and immediately close it — O(N) connection setups for N requests. Module-level means the pool is created once when the server starts and reused for every request. This is the correct pattern for any database/service client in a FastAPI app.
+
+**`HTTPException(status_code=503)`:** 503 = Service Unavailable. Used when ES is unreachable because the problem is not with the request — it's with a downstream dependency. A caller getting 503 knows to retry later. 500 = Internal Server Error (used for unexpected exceptions in the search route).
+
+**`response_model=SearchResponse`:** FastAPI uses this to automatically validate and serialize the return value. If `execute_search()` returns a dict that doesn't match `SearchResponse`'s shape, FastAPI raises a 500 before the response leaves the server. Also auto-generates the OpenAPI docs at `/docs`.
+
+**How to run the search API:**
+```bash
+# From project root
+.venv/bin/python -m uvicorn main:app --app-dir services/search-api --host 0.0.0.0 --port 8000
+```
+Note: `services/search-api` has a hyphen, which is NOT a valid Python module name. You cannot use `uvicorn services.search-api.main:app`. The `--app-dir` flag tells uvicorn to add that directory to `sys.path` and import `main` directly from there.
+
+**Verified working (Mac, Phase 2A):**
+- `GET /health` → `{"status": "ok", "es_url": "http://localhost:9200", "index": "beth-security-logs"}`
+- `POST /search` with `{"log_type": "dns", "page": 1, "page_size": 3}` → 131 DNS documents, `took_ms: 6`
+- Current Mac data: 269 DNS rows produced, 131 unique documents after MD5 deduplication
+
+---
+
 ## SECTION 8: HOW TO RUN EVERYTHING
 
 ```bash
@@ -833,6 +982,15 @@ pytest tools/dataset-ingestor/test_parsers.py -v
 
 # 7. Delete ES index and all data (for clean re-run during dev)
 curl -X DELETE http://localhost:9200/beth-security-logs
+
+# 8. Run the Phase 2A search API (from project root)
+.venv/bin/python -m uvicorn main:app --app-dir services/search-api --host 0.0.0.0 --port 8000
+
+# 9. Test the search API
+curl http://localhost:8000/health
+curl -s -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{"log_type": "dns", "page": 1, "page_size": 3}'
 ```
 
 ### Expected Startup Warnings — These Are Harmless, Do Not Panic
@@ -879,6 +1037,10 @@ post any further updates to google.api_core supporting this Python version.
 | **try/finally for consumer.close()** | `finally` block in `main()` always closes consumer | Without it, a crash leaves the connection open until Kafka's ~45 sec session timeout, blocking rebalance |
 | **elasticsearch client pinned <9.0.0** | `pip install "elasticsearch>=8.0.0,<9.0.0"` | v9 client sends `compatible-with=9`, rejected by ES 8.11.0 server with 400 error |
 | **group.id = "beam-ingestor-v2"** | Fresh group after failed v1 run | Original group committed 100k offsets during failed run (ES crash). New group = no committed offsets = full replay from offset 0 |
+| **`log_type` written to ES document** | `parsed["log_type"] = log_type` in `ParseLogFn.process()` | Field was used internally to pick the parser but never stored. Search API filtering on it returned 0 results. Fixed in Mac Phase 2A session. |
+| **`source_file` cannot replace `log_type`** | Derive type at write time, not query time | Wildcard/regex on `source_file` at query time bypasses ES inverted index — no cache, full scan, O(N). Also couples every consumer to filename conventions. |
+| **`filter` for exact match, `must` for full-text** | `sus`, `evil`, `log_type`, time range → `filter`. `dns_query` free text → `must` | `filter` has no scoring overhead and results are cached. `must` scores by BM25 relevance — correct for text search, wasteful for booleans/enums. |
+| **`es_client` is module-level in main.py** | Created once at startup, reused per request | Creating a client per request opens and closes a connection pool on every call — O(N) connection setups. Module-level = one pool, reused forever. |
 
 ---
 
@@ -936,6 +1098,19 @@ The user has been quizzed on and has demonstrated understanding of all of the fo
 - `setup_method()`: runs before each test method, creates fresh state for test isolation
 - Red → Green → Refactor: write failing test, fix code, verify passing, clean up
 - Why happy-path tests don't catch default-value bugs: the bug only triggers when the field is absent, not when it's present
+
+**FastAPI / Search API (Phase 2A):**
+- FastAPI — Python web framework. Routes defined with decorators (`@app.get`, `@app.post`). Pydantic models handle request validation and response serialization automatically.
+- Pydantic — validates data types at runtime. `Optional[Literal["dns"]]` means the field can be omitted or must be exactly `"dns"`. `ge=1` enforces minimum value. Invalid input returns 422 before the query touches ES.
+- `response_model=SearchResponse` — FastAPI validates the function's return value against this model and auto-generates OpenAPI docs at `/docs`.
+- `HTTPException(503)` — 503 = Service Unavailable (downstream dependency unreachable). 500 = Internal Server Error (unexpected exception). Different codes tell callers different things.
+- uvicorn — the ASGI server that runs FastAPI. `--app-dir services/search-api` adds that directory to `sys.path` so `main` can be imported directly. Required because `search-api` has a hyphen and is not a valid Python module name — you cannot use `services.search-api.main:app`.
+- ES Query DSL `bool` query — container for filter/must/should/must_not clauses. `filter` = exact match, no scoring, cached. `must` = full-text, BM25 relevance scoring, not cached. Wrong choice wastes CPU on every query.
+- `term` query — exact match on keyword field. No text analysis. Used for enums, IDs, labels.
+- `match` query — full-text search with tokenization/lowercasing. Used when relevance matters.
+- `.keyword` suffix — ES auto-creates two sub-fields for text: analyzed (for `match`) and `.keyword` (raw, for `term`). `host_name.keyword` is the exact unmodified string.
+- `track_total_hits=True` — forces ES to count ALL matching documents, not just up to 10,000.
+- Pagination: `from_offset = (page - 1) * page_size`. Page 1 = offset 0. Page 2 = offset 20.
 
 **Python specifics the user asked about:**
 - `glob.glob("path/*.csv")` — returns list of all file paths matching the wildcard pattern
@@ -1028,6 +1203,12 @@ Use this to calibrate where to probe vs. where to trust. Do not re-teach things 
 **`chunk.to_dict('records')` (explicitly unknown):**
 - User admitted during quiz they did not know what this does. See explanation in Section 7 under producer.py.
 
+**`filter` vs `must` in Elasticsearch (wrong first answer):**
+- Wrong answer: "filter returns all the logs but only shows us the ones with the filter, whereas must doesn't pull the ones that you have the filter on and requires more work."
+- What was wrong: Both `filter` and `must` restrict which documents come back. A document that doesn't match either one is excluded entirely. That is NOT the difference between them. The user described neither correctly.
+- Correct answer: Both exclude non-matching documents. The difference is scoring and caching. `must` calculates a BM25 relevance score for the condition — how WELL the document matched. `filter` does zero scoring — it's a pure yes/no decision. Filter results are cached by ES (same filter = same result = skip recomputation). `filter` is for exact matches (enums, booleans, ranges) where relevance is meaningless. `must` is for full-text where you want closest matches ranked first.
+- Consequence of getting this wrong: Putting `sus=1` in `must` instead of `filter` makes ES compute a relevance score for a boolean field on every document, burns CPU, and throws away the cache. At 3.8M documents this matters.
+
 ---
 
 ## SECTION 12: FULL PROJECT PHASE ROADMAP
@@ -1059,21 +1240,25 @@ CSV → Kafka → Beam → Elasticsearch. 24 parser tests passing.
 - All 15 BETH CSV files produced to Kafka (3,809,617 messages across 3 partitions)
 - Full ingest complete: **3,807,980 documents in `beth-security-logs`**
 
-### Phase 2A — FastAPI `/search` Endpoint (NEXT)
+### Phase 2A — FastAPI `/search` Endpoint ✅ COMPLETE (Mac, partial data)
 
-**What to build:** HTTP search API backed by Elasticsearch. This is the query interface for everything downstream (Incident Copilot, UI, ML features).
+**Built:** Three files in `services/search-api/` — `main.py`, `models.py`, `search.py`. Verified working on Mac with 131 DNS documents.
 
-**Capabilities needed:**
-- Query by time range, log type (`dns`/`deep_kernel`/`standard_host`), host name, `sus` label, `evil` label, free-text on `dns_query` or `process_name`
-- Pagination (from/size)
-- Response: paginated JSON with hits, total count, query time
+**What it supports:**
+- Filter by `log_type`, `sus`, `evil`, `host_name`, `process_name`, time range — all in ES `filter` context (cached, no scoring)
+- Free-text search on `dns_query` — in ES `must` context (BM25 relevance scoring)
+- Pagination via `page` / `page_size` (max 500 per page)
+- `/health` endpoint that pings ES and returns 503 if unreachable
+- Response includes `total`, `took_ms`, `page`, `page_size`, `hits[]`
 
-**Key concepts to teach:**
-- FastAPI route definition, Pydantic request/response models, dependency injection
-- Elasticsearch Query DSL: `bool` query with `must`, `filter`, `should`, `range`
-- `filter` context vs `must` context: filter doesn't affect relevance score and is cached (faster); must affects score (use for full-text search relevance)
-- ILM (Index Lifecycle Management): time-based index rollover for when log volume grows large
-- Caching: start without caching, add Redis later when tail latency becomes a problem
+**Current data state:**
+- Mac: 131 DNS documents (1 CSV file ingested with `log_type` field present)
+- Windows: 3,807,980 documents but NO `log_type` field — search filters return 0 until re-ingested (see Phase 1 section for steps)
+
+**Still to do before Phase 2A is production-ready:**
+- ILM (Index Lifecycle Management): time-based index rollover when log volume grows
+- Redis caching layer for repeated identical queries
+- Tests for the search API (equivalent of test_parsers.py for Phase 1)
 
 ### Phase 2B — ML Alert Triage Model
 
