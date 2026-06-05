@@ -10,8 +10,8 @@ class SearchRequest(BaseModel):
     host_name: Optional[str] = None
     process_name: Optional[str] = None
     dns_query: Optional[str] = None
-    timestamp_from: Optional[str] = Field(None, example="2021-05-16T00:00:00Z")
-    timestamp_to: Optional[str] = Field(None, example="2021-05-17T00:00:00Z")
+    timestamp_from: Optional[str] = Field(None, json_schema_extra={"example": "2021-05-16T00:00:00Z"})
+    timestamp_to: Optional[str] = Field(None, json_schema_extra={"example": "2021-05-17T00:00:00Z"})
     page: int = Field(1, ge=1)
     page_size: int = Field(20, ge=1, le=500)
 
