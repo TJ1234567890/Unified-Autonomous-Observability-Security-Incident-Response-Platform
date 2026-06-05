@@ -169,7 +169,7 @@ def _build_consumer():
         "sasl.mechanisms": KAFKA_PRODUCER_CONFIG["sasl.mechanisms"],
         "sasl.username": KAFKA_PRODUCER_CONFIG["sasl.username"],
         "sasl.password": KAFKA_PRODUCER_CONFIG["sasl.password"],
-        "group.id": "beam-ingestor-v2",
+        "group.id": "beam-ingestor-v3",
         "auto.offset.reset": "earliest",
     }
 

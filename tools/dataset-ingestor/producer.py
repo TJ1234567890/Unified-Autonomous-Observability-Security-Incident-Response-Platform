@@ -20,7 +20,7 @@ from confluent_kafka import Producer
 from config import KAFKA_PRODUCER_CONFIG, KAFKA_TOPIC
 
 
-def delivery_report(err, msg):
+def delivery_report(err, _msg):
     """
     Callback invoked once per message to confirm delivery.
 
@@ -78,12 +78,20 @@ def produce_file(producer: Producer, filepath: str):
             # produce() is non-blocking. It puts the message into an internal
             # buffer. The 'key' determines which partition this message goes to.
             # Same key = same partition = ordering guaranteed within that file.
-            producer.produce(
-                topic=KAFKA_TOPIC,
-                key=filename,
-                value=json.dumps(message),
-                callback=delivery_report,
-            )
+            # If the internal queue is full (BufferError), block for 1s to let
+            # deliveries drain before retrying. This is backpressure — slow the
+            # producer to match the network throughput to Confluent Cloud.
+            while True:
+                try:
+                    producer.produce(
+                        topic=KAFKA_TOPIC,
+                        key=filename,
+                        value=json.dumps(message),
+                        callback=delivery_report,
+                    )
+                    break
+                except BufferError:
+                    producer.poll(1)
 
             rows_produced += 1
 
