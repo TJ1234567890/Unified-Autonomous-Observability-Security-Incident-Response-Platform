@@ -6,3 +6,9 @@ fastapi
 uvicorn
 apache-beam[gcp]
 pytest
+xgboost
+scikit-learn
+lightgbm
+numpy
+imbalanced-learn
+optuna
