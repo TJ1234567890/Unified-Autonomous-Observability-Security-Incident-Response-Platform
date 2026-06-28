@@ -105,7 +105,8 @@ def _extract_features(log_type: str, attrs: dict) -> dict:
             rv = 0
 
         try:
-            uid = int(attrs.get("user_id") or -1)
+            uid_raw = attrs.get("user_id")
+            uid = int(uid_raw) if uid_raw is not None else -1
         except (ValueError, TypeError):
             uid = -1
 
