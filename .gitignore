@@ -7,4 +7,5 @@ data/*
 *.tfstate
 *.tfstate.backup
 QUIZ_LOG.md
+PLATFORM_DEEP_DIVE.md
 *.joblib
