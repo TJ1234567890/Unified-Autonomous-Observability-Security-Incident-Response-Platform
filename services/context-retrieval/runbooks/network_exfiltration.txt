@@ -1,0 +1,42 @@
+RUNBOOK: Network Exfiltration Detected
+Severity: Critical
+Tags: network, exfiltration, dns, wget, curl, data-loss
+
+TRIGGER CONDITIONS
+- Process executing wget, curl, nc, or socat to an external IP
+- High-volume DNS queries to unusual domains
+- DNS query entropy above 3.5 bits (DGA pattern)
+- Multiple NXDOMAIN responses in short succession
+
+IMMEDIATE ACTIONS (first 5 minutes)
+1. Identify the source host and process:
+   - Query ES for the offending event: log_type=deep_kernel, feat_args_has_network=1
+   - Note the process_name, process_id, parent_process_id, and user_id
+   - Check if the process is a known legitimate binary or something unexpected
+
+2. Block outbound traffic from the host:
+   - If Kubernetes: kubectl label node <node> quarantine=true
+   - Add a network policy denying egress from the pod's namespace
+   - If bare metal: iptables -A OUTPUT -s <host_ip> -j DROP
+
+3. Preserve evidence before killing:
+   - Capture network state: ss -tunap, netstat -an
+   - Dump the process: cat /proc/<pid>/maps, ls -la /proc/<pid>/fd
+   - Copy any suspicious binaries to a safe location before terminating
+
+INVESTIGATION
+- Check parent process tree: did a web server or scheduled job spawn the exfiltration process?
+- Look for persistence mechanisms: crontab -l, ls /etc/cron.d/, systemctl list-units
+- Review DNS query log for the 30 minutes before the event for reconnaissance patterns
+- Check if any files were accessed before the network call (openat events with the same process_id)
+
+ESCALATION
+- If user_id=0 (root): escalate immediately, assume full host compromise
+- If the destination IP resolves to known C2 infrastructure: involve threat intel team
+- If multiple hosts affected simultaneously: declare incident, activate war room
+
+RECOVERY
+- Rotate all credentials that existed on the compromised host
+- Re-image the host from a known-good snapshot
+- Review and harden egress firewall rules
+- Add the destination IP/domain to the block list

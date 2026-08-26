@@ -8,4 +8,7 @@ data/*
 *.tfstate.backup
 QUIZ_LOG.md
 PLATFORM_DEEP_DIVE.md
+PHASE_REVIEW_QUESTIONS.md
 *.joblib
+*.log
+*.err

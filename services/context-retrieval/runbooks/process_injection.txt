@@ -1,0 +1,59 @@
+RUNBOOK: Process Injection / Suspicious Memory Operation
+Severity: Critical
+Tags: process-injection, mmap, mprotect, ptrace, shellcode, memory
+
+TRIGGER CONDITIONS
+- mmap with PROT_EXEC | PROT_WRITE flags (writable executable memory — classic shellcode staging)
+- mprotect changing a memory region from RW to RX after writing (write-then-execute pattern)
+- ptrace called on a process that is not a debugger (gdb, strace, lldb)
+- /proc/<pid>/mem written directly (direct process memory injection)
+- execve of a binary that does not exist on disk (fileless malware — memfd_create pattern)
+
+BACKGROUND
+Process injection is a technique where an attacker executes code inside an already-running
+process rather than starting a new one. This bypasses process-level security controls because
+the injected code runs with the victim process's identity, permissions, and network connections.
+The memory syscalls (mmap, mprotect) that enable this are visible at the kernel level and are
+captured by the eBPF agent.
+
+The most dangerous variant: fileless malware. The attacker downloads shellcode entirely into
+memory (never touches disk), marks it executable via mprotect, and executes it. No binary
+file = no file hash to detect = antivirus is blind.
+
+IMMEDIATE ACTIONS (first 2 minutes — fileless attacks are time-critical)
+1. Identify the injecting process and the victim:
+   - Which process called mmap with PROT_EXEC | PROT_WRITE?
+   - Which process did it ptrace or write to via /proc/<pid>/mem?
+   - What is the parent process of the injector?
+
+2. Dump the suspicious memory region before killing (if possible):
+   - gcore <pid> (generates core dump including memory)
+   - dd if=/proc/<pid>/mem of=memdump.bin — extract the executable region
+   - This is critical for malware analysis: it may be the only copy of the code
+
+3. Kill the injector and the victim process:
+   - kill -9 <injector_pid> <victim_pid>
+   - If the victim is a critical process (sshd, webserver): notify before killing
+
+INVESTIGATION
+- What did the injected code do? Check events from the victim process after the injection timestamp
+  - New network connections from the victim (outbound C2 connection)
+  - File reads or writes from the victim (credential access, data staging)
+  - New child processes spawned by the victim
+- Is this a known technique? Look for patterns:
+  - Injector is a Python/node/java process → likely web exploitation
+  - Injector is a document handler → likely phishing document
+
+MEMORY FORENSICS
+- Analyze the core dump or memory region with strings, hexdump, or a sandbox
+- Look for: embedded IPs/domains (C2 addresses), API function names (Windows API in Linux = suspicious)
+- Submit the memory region hash to threat intel feeds
+
+ESCALATION
+- Any confirmed process injection: immediate escalation, no exceptions
+- Fileless execution: treat as sophisticated, targeted attack — escalate to threat intel team
+
+RECOVERY
+- Re-image the host — fileless malware leaves no guaranteed forensic artifact on disk
+- Audit all other processes that the victim process had socket connections to
+- Review the code path that allowed initial access to the injector process

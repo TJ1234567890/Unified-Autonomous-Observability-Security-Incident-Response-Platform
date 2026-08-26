@@ -1,0 +1,61 @@
+RUNBOOK: Triage Prediction Service Degraded
+Severity: Medium
+Tags: ml-service, latency, model, inference, kubernetes, availability
+
+TRIGGER CONDITIONS
+- /predict endpoint p99 latency exceeds 500ms (baseline: ~15ms)
+- /health endpoint returning 503 or not responding
+- Kubernetes pod in CrashLoopBackOff or OOMKilled state
+- Model file (.joblib) not found on startup (pod fails readiness probe)
+- XGBoost DMatrix construction errors in logs (type mismatch in feature vector)
+
+BACKGROUND
+The triage prediction service (port 8001) is a FastAPI app that loads two XGBoost models
+at startup and scores security events in real time. It sits between the Kafka/Beam pipeline
+and the incident copilot. If it degrades, security events are not scored — the incident
+copilot receives no triage signal and defaults to manual review.
+
+IMMEDIATE ACTIONS (first 5 minutes)
+1. Check pod status:
+   kubectl get pods -n security-platform -l app=triage-model
+   kubectl describe pod <pod-name>
+   kubectl logs <pod-name> --previous (if restarting)
+
+2. Check the /health endpoint directly:
+   curl http://<service-ip>:8001/health
+   Expected: {"status": "ok", "sus_threshold": 0.365, "evil_threshold": 0.8322, "feature_count": 13}
+
+3. If OOMKilled: increase memory limit in Deployment spec and redeploy
+   - Current model size: ~50MB for both models
+   - Minimum viable memory limit: 512Mi
+   - Recommended: 1Gi
+
+COMMON FAILURE MODES
+
+Model file not found on startup:
+- The .joblib files are gitignored and must be copied to the pod via a Kubernetes Secret
+  or mounted volume — they are not baked into the container image
+- Fix: ensure the model volume mount is correctly configured in the Deployment spec
+
+Feature column mismatch:
+- If feature_columns.joblib was regenerated with a different feature set than the model
+  was trained on, XGBoost will silently use wrong column indices
+- Fix: retrain the model and regenerate feature_columns.joblib together (run train.py)
+
+High latency (not OOM):
+- Check if XGBoost is using all available CPU threads: set OMP_NUM_THREADS=1 in the pod
+  env to prevent thread contention when multiple pods share a node
+- Check if the DMatrix is being rebuilt on every request: it should not be — the model
+  is module-level but the DMatrix is built per request (this is correct)
+
+ESCALATION
+- If the service has been down more than 10 minutes: escalate to on-call engineer
+- If the service is down during an active security incident: Critical — manual triage required
+
+RECOVERY
+- Deploy a known-good image tag (the previous deployment)
+  kubectl rollout undo deployment/triage-model -n security-platform
+- Verify recovery: check /health and run a test prediction:
+  curl -X POST http://<service-ip>:8001/predict -H "Content-Type: application/json" \
+    -d '{"log_type": "dns", "attributes": {"dns_query": "google.com", "dns_response_code": 0}}'
+- Expected response: sus_flag=false, evil_flag=false, both probabilities near 0

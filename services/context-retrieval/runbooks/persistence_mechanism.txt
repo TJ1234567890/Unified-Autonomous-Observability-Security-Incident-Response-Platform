@@ -1,0 +1,57 @@
+RUNBOOK: Persistence Mechanism Installed
+Severity: High
+Tags: persistence, cron, systemd, init, backdoor, startup
+
+TRIGGER CONDITIONS
+- Write to /etc/cron.d/, /var/spool/cron/, or /etc/crontab by a non-root or unexpected process
+- New systemd unit file created in /etc/systemd/system/ or /usr/lib/systemd/system/
+- Modification of /etc/rc.local, /etc/profile.d/, or /etc/environment
+- New entry in /etc/passwd or /etc/shadow (new user created)
+- SSH authorized_keys file modified on a host that does not use key-based auth normally
+
+BACKGROUND
+After an attacker gains initial access, their first goal is persistence — ensuring they can
+return even if the compromised process is killed or the host is rebooted. Persistence
+mechanisms include cron jobs, systemd services, shell profile modifications, and backdoor
+user accounts. The BETH dataset captures the file write syscalls that install these mechanisms.
+
+IMMEDIATE ACTIONS (first 5 minutes)
+1. Identify the persistence mechanism:
+   - What file was written? Check the args field of the openat/write event
+   - When was it written? Check the timestamp
+   - Who wrote it? Check user_id and process_name
+
+2. Examine the content of the new file:
+   - If cron: cat /etc/cron.d/<new_file> — what command does it run? What user?
+   - If systemd unit: systemctl cat <new_unit> — what binary does it execute?
+   - If new user: grep <new_user> /etc/passwd — what UID? Does it have a shell?
+
+3. Disable without deleting (preserve evidence):
+   - Cron: chmod 000 /etc/cron.d/<file> (disables without deleting)
+   - Systemd: systemctl disable <unit> --now
+   - New user: usermod -L <username> (lock, don't delete yet)
+
+INVESTIGATION
+- Trace backward: what process installed this persistence? (parent_process_id chain)
+- Is the binary it executes present on the system? Where?
+- Does this binary match any known malware hash? (check VirusTotal)
+- Are there other persistence mechanisms? A thorough attacker installs multiple
+
+FULL PERSISTENCE AUDIT CHECKLIST
+Run these on any host suspected of compromise:
+- crontab -l -u root; for user in $(cut -f1 -d: /etc/passwd); do crontab -l -u $user 2>/dev/null; done
+- find /etc/cron.d /etc/cron.daily /etc/cron.weekly /etc/cron.monthly -type f
+- systemctl list-units --type=service | grep -v native
+- ls -la /etc/rc.local /etc/profile.d/ /etc/environment
+- awk -F: '($3 >= 1000) {print}' /etc/passwd (list non-system users)
+- find / -name ".bashrc" -o -name ".bash_profile" -o -name ".profile" | xargs grep -l "wget\|curl\|nc\|bash" 2>/dev/null
+
+ESCALATION
+- If persistence has survived a prior reboot (check systemctl status): escalate immediately
+- If a backdoor user account was created with sudo access: Critical
+
+RECOVERY
+- Remove all identified persistence mechanisms
+- Reset passwords or lock backdoor accounts
+- Re-image if the scope of persistence is unclear or multiple mechanisms were found
+- Audit all other hosts that the compromised user or service account had access to

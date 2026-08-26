@@ -12,3 +12,8 @@ lightgbm
 numpy
 imbalanced-learn
 optuna
+sentence-transformers
+joblib
+google-generativeai
+requests
+httpx

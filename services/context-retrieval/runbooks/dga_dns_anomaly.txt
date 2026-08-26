@@ -1,0 +1,50 @@
+RUNBOOK: DGA / DNS Anomaly Detected
+Severity: High
+Tags: dns, dga, c2, beaconing, domain-generation-algorithm
+
+TRIGGER CONDITIONS
+- DNS query entropy above 3.5 bits for a domain not in the allowlist
+- High rate of NXDOMAIN responses (dns_response_code=3) from a single host
+- DNS queries to newly registered domains (registered within 30 days)
+- Consistent beaconing pattern: DNS queries at regular intervals to the same base domain
+
+BACKGROUND
+Domain Generation Algorithms (DGA) are used by malware to generate hundreds of pseudo-random
+domain names daily. The malware queries these domains until one resolves to the C2 server.
+This makes blocking individual domains ineffective. The signal is the pattern of high-entropy
+queries with frequent NXDOMAIN responses.
+
+IMMEDIATE ACTIONS (first 5 minutes)
+1. Identify the querying host and process:
+   - Query ES: log_type=dns, feat_dns_query_entropy > 3.5, sus=1
+   - Note the source_ip and cross-reference with the kernel event index to find the process
+
+2. Block DNS resolution at the resolver level:
+   - Add the domain pattern to the DNS blocklist on the internal resolver
+   - Enable response policy zones (RPZ) to sinkhole matching queries
+
+3. Capture a baseline:
+   - How many NXDOMAIN queries in the last hour from this host?
+   - What is the query interval? Consistent intervals = beaconing
+   - What is the top-level domain? .ru, .tk, .pw are higher risk
+
+INVESTIGATION
+- Identify all processes making DNS calls on the host (use eBPF agent: openat + connect events)
+- Check for the malware binary: scan /tmp, /dev/shm, /var/tmp for unexpected executables
+- Look for persistence: cron jobs, systemd units, or init scripts pointing to the binary
+- Check if any query actually resolved (dns_response_code=0) and if the host connected to that IP
+
+THREAT INTEL ENRICHMENT
+- Submit the queried domains to VirusTotal API
+- Check the destination IPs against threat intel feeds (AbuseIPDB, Shodan)
+- Search for the domain pattern in known DGA family databases
+
+ESCALATION
+- If any query resolved AND the host made a connection to that IP: escalate to Critical
+- If the same DGA pattern appears on multiple hosts: declare incident
+
+RECOVERY
+- Identify and remove the malware binary and all persistence mechanisms
+- Change all credentials stored on the host
+- Update endpoint detection rules to catch this DGA family
+- Add IOCs (domains, IPs, hashes) to the SIEM detection rules

@@ -1,0 +1,50 @@
+RUNBOOK: Lateral Movement Detected
+Severity: High
+Tags: lateral-movement, ssh, psexec, smb, pivot, credential-reuse
+
+TRIGGER CONDITIONS
+- SSH connection initiated FROM a host that does not normally originate SSH (non-bastion)
+- execve of ssh, scp, rsync with a remote host argument that is internal (RFC1918 range)
+- Same credentials used successfully on multiple hosts within a short window
+- Process spawning network tools (nc, socat) targeting internal IP ranges
+
+BACKGROUND
+Lateral movement is an attacker moving from one compromised host to other hosts in the network
+using credentials, stolen tokens, or exploits. The goal is to reach higher-value targets
+(domain controllers, databases, secret stores). The BETH dataset captures the syscall-level
+signals of this behavior: ssh execve events, internal network connections, and credential reuse.
+
+IMMEDIATE ACTIONS (first 10 minutes)
+1. Map the movement graph:
+   - Starting from the initial compromised host, find all outbound SSH/network events
+   - For each destination host, check if it then made further outbound connections
+   - Build the lateral movement chain: Host A -> Host B -> Host C
+
+2. Identify what credentials were used:
+   - SSH key or password? Check auth logs on the destination host
+   - If a service account was used, audit all systems that service account has access to
+
+3. Isolate all hosts in the movement chain:
+   - Apply network policy to block east-west traffic from the affected hosts
+   - Do not re-image yet — preserve for forensics
+
+INVESTIGATION
+- What was the initial access point? Trace back to the origin host
+- What is the attacker's objective? Look at what they accessed on each hop
+- Did they leave backdoors on intermediate hosts? Check for new user accounts, SSH keys, cron jobs
+- Is there a pattern? Are they moving toward a specific subnet (database tier, admin hosts)?
+
+NETWORK SEGMENTATION REVIEW
+- Should the source host have SSH access to the destination host at all?
+- Are there firewall rules that should have blocked this but didn't?
+- Is the network properly segmented (database hosts not reachable from web tier)?
+
+ESCALATION
+- If the attacker has reached a database host, secret store, or domain controller: Critical
+- If the movement is still ongoing: treat as an active incident with live attacker
+
+RECOVERY
+- Rotate all credentials that existed on any host in the movement chain
+- Re-image hosts in reverse order (last hop first, then work backward)
+- Patch the initial access vulnerability before restoring any host to production
+- Implement or review network segmentation to prevent similar pivoting in the future

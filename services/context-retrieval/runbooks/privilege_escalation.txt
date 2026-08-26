@@ -1,0 +1,41 @@
+RUNBOOK: Privilege Escalation Detected
+Severity: Critical
+Tags: privilege-escalation, root, setuid, sudo, kernel-exploit
+
+TRIGGER CONDITIONS
+- Process running as user_id=0 (root) spawned by a non-root parent
+- execve of /bin/su, sudo, or pkexec from an unexpected parent process
+- Access to /etc/passwd, /etc/shadow, or /etc/sudoers
+- SUID binary executed outside of /usr/bin or /bin
+
+IMMEDIATE ACTIONS (first 5 minutes)
+1. Confirm the escalation path:
+   - Query: log_type=deep_kernel, feat_is_root_user=1, feat_args_has_sensitive_path=1
+   - Identify the chain: which process (parent_process_id) spawned the root process?
+   - Was the parent process a web application, script interpreter, or user session?
+
+2. Determine scope:
+   - Is this a single host or are multiple hosts showing the same pattern?
+   - What did the root process do after escalation? Check subsequent events with the same process_id
+
+3. Contain the escalated session:
+   - Kill the root process: kill -9 <pid>
+   - Lock the user account that initiated the escalation: usermod -L <username>
+   - If via exploit: patch the vulnerable binary immediately or remove it
+
+INVESTIGATION
+- Check /etc/sudoers and /etc/sudoers.d/ for unauthorized entries
+- Audit SUID binaries: find / -perm -4000 -type f 2>/dev/null
+- Review auth logs: grep -i 'su\|sudo\|root' /var/log/auth.log
+- Check for new user accounts created after the escalation: grep -E ":[0-9]+:[0-9]+:" /etc/passwd | sort -t: -k3 -n | tail -20
+
+ESCALATION
+- Any confirmed privilege escalation to root: immediate escalation to security lead
+- If the escalation used a kernel exploit: all hosts on the same kernel version are at risk
+- Document the exact CVE if a known exploit was used
+
+RECOVERY
+- Remove any backdoors or new accounts created by the attacker
+- Patch the vulnerability that enabled escalation
+- Review sudo rules and remove any unnecessary NOPASSWD entries
+- Enable auditd for ongoing root activity monitoring

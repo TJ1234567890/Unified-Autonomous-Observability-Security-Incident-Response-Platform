@@ -1,0 +1,53 @@
+RUNBOOK: Reverse Shell / Interactive Shell Spawned
+Severity: Critical
+Tags: reverse-shell, shell, bash, nc, socat, interactive-session
+
+TRIGGER CONDITIONS
+- execve of /bin/bash or /bin/sh with stdin/stdout redirected to a socket
+- nc (netcat), ncat, socat, or bash executed with -e or -c flag and an IP address in args
+- Shell process spawned as child of a web server process (nginx, apache, gunicorn, node)
+- Shell spawned from an unexpected parent (e.g., python, php, java)
+
+BACKGROUND
+A reverse shell is when an attacker causes a compromised host to initiate a connection BACK
+to the attacker's machine, then use that connection as an interactive shell. This bypasses
+inbound firewall rules because the connection is outbound. It is one of the most reliable
+post-exploitation techniques and almost always indicates active hands-on-keyboard attacker
+activity.
+
+IMMEDIATE ACTIONS (first 2 minutes — this is time critical)
+1. Verify the reverse shell is active:
+   - Check if the shell process is still running: ps aux | grep <pid>
+   - Check its open file descriptors: ls -la /proc/<pid>/fd | grep socket
+
+2. Capture the attacker's IP before killing the process:
+   - ss -tunap | grep <pid>
+   - This gives you the remote IP the shell is connected to — preserve this
+
+3. Kill the shell process and its children:
+   - kill -9 <pid> and all child pids
+   - Killing only the parent may leave child processes running
+
+4. Block the attacker's IP immediately:
+   - iptables -A OUTPUT -d <attacker_ip> -j DROP
+   - iptables -A INPUT -s <attacker_ip> -j DROP
+
+INVESTIGATION
+- How did the shell get spawned? Trace back via parent_process_id chain
+  - Web server parent → likely RCE via web application vulnerability
+  - Cron job parent → likely persistence from a prior compromise
+  - SSH parent → likely stolen credentials
+- What did the attacker do during the session?
+  - Query kernel events for the shell's process_id and child process_ids
+  - Look for: file reads (openat), new file writes, additional network connections, new processes
+
+ESCALATION
+- Reverse shell = confirmed active attacker on the host: IMMEDIATE escalation, no exceptions
+- Notify: security lead, system owner, and if the host handles customer data, legal/compliance
+
+RECOVERY
+- Assume the entire host is compromised — do not trust any file or binary on it
+- Preserve a forensic image of the disk before re-imaging
+- Re-image from known-good snapshot
+- Identify and patch the initial access vector (web app vuln, stolen creds, etc.)
+- Rotate ALL credentials that existed on the host

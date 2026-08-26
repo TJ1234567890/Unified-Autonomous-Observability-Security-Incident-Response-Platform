@@ -1,0 +1,55 @@
+RUNBOOK: Memory Anomaly / Potential Memory Leak
+Severity: Medium
+Tags: memory, oom, heap, gc, memory-leak, allocation
+
+TRIGGER CONDITIONS
+- Heap memory growing monotonically over 30+ minutes with no plateau
+- GC pause time increasing while freed memory per cycle decreases
+- Process RSS exceeding 2x its baseline for the same request load
+- OOM killer events in kernel logs (dmesg | grep oom)
+- mmap or brk syscalls growing without corresponding munmap calls
+
+BACKGROUND
+Memory leaks occur when a process allocates memory it never releases. In Python, this is
+usually a reference cycle or a global collection (dict, list, set) that grows unbounded.
+The Beam pipeline's Memory Guard detects this by computing a rolling slope of heap usage
+over a sliding window — if the slope is consistently positive and the R-squared is high,
+that is a leak signal, not noise.
+
+IMMEDIATE ACTIONS (first 10 minutes)
+1. Confirm the anomaly is real (not a spike):
+   - Is memory still growing, or did it plateau and come down?
+   - What is the request rate? Higher load = higher peak memory, not necessarily a leak
+   - How long has the growth trend been linear? Under 5 minutes = likely a spike
+
+2. If confirmed as a leak, enable memory profiling:
+   - Python: PYTHONTRACEMALLOC=1 uvicorn ... (captures allocation traceback)
+   - Or attach py-spy: py-spy record -o profile.svg --pid <pid>
+
+3. Decide: restart now or profile first?
+   - If memory is above 80% of the container limit: restart immediately to prevent OOM kill
+   - If memory is at 50-70%: profile first to collect diagnostics, then restart
+
+DIAGNOSIS
+- Which allocations are growing? Run: python -c "import tracemalloc; tracemalloc.start()" and snapshot
+- Common Python leak sources:
+  - Unbounded caches: lru_cache without maxsize, or module-level dicts that grow forever
+  - Circular references with __del__ methods (these prevent garbage collection)
+  - Long-lived list accumulating results (e.g., a buffer in a DoFn that grows across bundles)
+  - Logging handlers holding references to logged objects
+
+KUBERNETES AUTO-RESTART (Memory Guard trigger)
+This runbook may be triggered automatically by the Memory Guard service. If the restart
+was automated, review:
+- Why did the leak start? Was there a recent deployment?
+- Is the leak reproducible? Does memory grow again after restart?
+- If yes: the fix must be a code change, not just a restart
+
+ESCALATION
+- Repeated auto-restarts within 1 hour: escalate to on-call engineer
+- If the service handles security-critical data (triage model, incident copilot): notify immediately
+
+RECOVERY
+- Deploy a fixed version of the service with the leak patched
+- Set a memory limit in the Kubernetes Deployment spec to ensure OOM kill before the node is starved
+- Add a memory usage metric to Prometheus alerting with a threshold alert
